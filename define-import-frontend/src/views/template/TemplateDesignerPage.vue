@@ -1,8 +1,8 @@
 <script setup>
-import { ref, reactive, computed, onMounted, watch, nextTick } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
+import { ref, reactive, computed, onMounted, onBeforeUnmount, watch, nextTick } from 'vue'
+import { useRoute, useRouter, onBeforeRouteLeave } from 'vue-router'
 import { templateApi, previewApi } from '@/api/index.js'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   ArrowLeft, Plus, Delete, Upload, Setting, Document
 } from '@element-plus/icons-vue'
@@ -278,8 +278,11 @@ const handleSave = async () => {
     }
     if (isEdit.value) {
       payload.id = Number(route.params.id)
+      await templateApi.update(route.params.id, payload)
+    } else {
+      await templateApi.create(payload)
     }
-    await templateApi.create(payload)
+    isDirty.value = false
     ElMessage.success(isEdit.value ? '模板更新成功' : '模板创建成功')
     router.push('/template')
   } catch (e) {
@@ -352,6 +355,47 @@ const initCollapseState = (sheetIdx, groupCount) => {
     activeGroupCollapses.value[sheetIdx] = Array.from({ length: groupCount }, (_, i) => i)
   }
 }
+
+// ─── Dirty state tracking & unsaved changes warning ─────
+const isDirty = ref(false)
+
+watch(templateConfig, () => {
+  isDirty.value = true
+}, { deep: true })
+
+const handleBeforeUnload = (e) => {
+  if (isDirty.value) {
+    e.preventDefault()
+    e.returnValue = ''
+  }
+}
+
+onMounted(() => {
+  window.addEventListener('beforeunload', handleBeforeUnload)
+})
+
+onBeforeUnmount(() => {
+  window.removeEventListener('beforeunload', handleBeforeUnload)
+})
+
+onBeforeRouteLeave((to, from, next) => {
+  if (isDirty.value) {
+    ElMessageBox.confirm('存在未保存的修改，确定离开？', '提示', {
+      type: 'warning'
+    }).then(() => next()).catch(() => next(false))
+  } else {
+    next()
+  }
+})
+
+// ─── File upload validation ─────────────────────────────
+const beforeUpload = (file) => {
+  const isExcel = /\.(xlsx|xls)$/i.test(file.name)
+  const isLt50M = file.size / 1024 / 1024 < 50
+  if (!isExcel) { ElMessage.error('只能上传 .xlsx 或 .xls 文件'); return false }
+  if (!isLt50M) { ElMessage.error('文件大小不能超过 50MB'); return false }
+  return true
+}
 </script>
 
 <template>
@@ -367,7 +411,7 @@ const initCollapseState = (sheetIdx, groupCount) => {
         <el-tag v-if="isEdit" type="info" size="small" class="edit-tag">编辑模式</el-tag>
       </div>
       <el-button type="primary" @click="handleSave" :loading="saving">
-        <el-icon><Document /></el-icon> 保存模板
+        <el-icon><Document /></el-icon> {{ isEdit ? '更新模板' : '保存模板' }}
       </el-button>
     </div>
 
@@ -381,6 +425,7 @@ const initCollapseState = (sheetIdx, groupCount) => {
               :auto-upload="false"
               :show-file-list="false"
               accept=".xlsx,.xls"
+              :before-upload="beforeUpload"
               :on-change="handleUpload"
             >
               <el-button type="primary" plain>
@@ -566,6 +611,47 @@ const initCollapseState = (sheetIdx, groupCount) => {
                 </el-row>
               </el-form>
 
+              <!-- ── Price match rule (when contentType is PRICE) ── -->
+              <div v-if="sheetCfg.contentType === 'PRICE'" class="price-match-section">
+                <div class="section-header">
+                  <span class="section-title">价格匹配规则</span>
+                </div>
+                <el-form label-width="140px" label-position="right" size="default">
+                  <el-form-item label="匹配字段">
+                    <el-select
+                      :model-value="sheetCfg.priceMatchRule?.matchFields ?? []"
+                      @update:model-value="val => { if (!sheetCfg.priceMatchRule) sheetCfg.priceMatchRule = {}; sheetCfg.priceMatchRule.matchFields = val }"
+                      multiple
+                      placeholder="选择匹配字段"
+                      style="width: 320px"
+                    >
+                      <el-option label="品名/品类" value="category" />
+                      <el-option label="规格" value="spec" />
+                      <el-option label="产地" value="origin" />
+                      <el-option label="材质" value="material" />
+                    </el-select>
+                  </el-form-item>
+                  <el-form-item label="壁厚匹配模式">
+                    <el-radio-group
+                      :model-value="sheetCfg.priceMatchRule?.wallThicknessMatchMode ?? 0"
+                      @update:model-value="val => { if (!sheetCfg.priceMatchRule) sheetCfg.priceMatchRule = {}; sheetCfg.priceMatchRule.wallThicknessMatchMode = val }"
+                    >
+                      <el-radio :value="0">精确匹配</el-radio>
+                      <el-radio :value="1">区间匹配</el-radio>
+                    </el-radio-group>
+                  </el-form-item>
+                  <el-form-item label="规格区间匹配模式">
+                    <el-radio-group
+                      :model-value="sheetCfg.priceMatchRule?.specRangeMatchMode ?? 0"
+                      @update:model-value="val => { if (!sheetCfg.priceMatchRule) sheetCfg.priceMatchRule = {}; sheetCfg.priceMatchRule.specRangeMatchMode = val }"
+                    >
+                      <el-radio :value="0">不处理</el-radio>
+                      <el-radio :value="1">区间匹配</el-radio>
+                    </el-radio-group>
+                  </el-form-item>
+                </el-form>
+              </div>
+
               <!-- ── Data groups ── -->
               <div class="groups-section">
                 <div class="section-header">
@@ -654,6 +740,69 @@ const initCollapseState = (sheetIdx, groupCount) => {
                           </el-button>
                         </div>
                         <el-table :data="group.fieldMappings" border size="small" class="mapping-table">
+                          <el-table-column type="expand" width="30">
+                            <template #default="{ row }">
+                              <div class="transform-config-area">
+                                <div class="transform-title">数据转换</div>
+                                <el-form label-width="120px" size="small" class="transform-form">
+                                  <!-- 字符转换 -->
+                                  <el-form-item label="字符转换">
+                                    <div class="transform-block">
+                                      <el-checkbox
+                                        :model-value="row.transform?.enableCharRule ?? false"
+                                        @change="val => { if (!row.transform) row.transform = {}; row.transform.enableCharRule = val }"
+                                      >启用预置规则</el-checkbox>
+                                      <div v-if="row.transform?.enableCharRule" style="margin-top: 6px">
+                                        <span class="config-label">规则组：</span>
+                                        <el-select
+                                          :model-value="row.transform?.charRuleGroups ?? []"
+                                          @update:model-value="val => { if (!row.transform) row.transform = {}; row.transform.charRuleGroups = val }"
+                                          multiple
+                                          placeholder="选择规则组"
+                                          size="small"
+                                          style="width: 220px"
+                                        >
+                                          <el-option label="SPEC (规格处理)" value="SPEC" />
+                                          <el-option label="COMMON (通用处理)" value="COMMON" />
+                                        </el-select>
+                                      </div>
+                                    </div>
+                                  </el-form-item>
+                                  <!-- 行间继承 (spec field only) -->
+                                  <el-form-item v-if="row.fieldName === 'spec'" label="行间继承">
+                                    <div class="transform-block">
+                                      <el-switch
+                                        :model-value="row.transform?.enableRowInherit ?? false"
+                                        @change="val => { if (!row.transform) row.transform = {}; row.transform.enableRowInherit = val }"
+                                      />
+                                      <template v-if="row.transform?.enableRowInherit">
+                                        <div style="margin-top: 6px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap;">
+                                          <div style="display: flex; align-items: center; gap: 4px;">
+                                            <span class="config-label">分隔符：</span>
+                                            <el-input
+                                              :model-value="row.transform?.rowInheritSeparator ?? '*'"
+                                              @update:model-value="val => { if (!row.transform) row.transform = {}; row.transform.rowInheritSeparator = val }"
+                                              size="small"
+                                              style="width: 80px"
+                                            />
+                                          </div>
+                                          <div style="display: flex; align-items: center; gap: 4px;">
+                                            <span class="config-label">部分值检测正则：</span>
+                                            <el-input
+                                              :model-value="row.transform?.rowInheritPartialPattern ?? '^[\\\\d.]+$'"
+                                              @update:model-value="val => { if (!row.transform) row.transform = {}; row.transform.rowInheritPartialPattern = val }"
+                                              size="small"
+                                              style="width: 160px"
+                                            />
+                                          </div>
+                                        </div>
+                                      </template>
+                                    </div>
+                                  </el-form-item>
+                                </el-form>
+                              </div>
+                            </template>
+                          </el-table-column>
                           <el-table-column label="字段" width="130">
                             <template #default="{ row }">
                               <el-select v-model="row.fieldName" placeholder="选择字段" size="small" filterable allow-create>
@@ -1100,5 +1249,40 @@ const initCollapseState = (sheetIdx, groupCount) => {
   padding: 16px;
   font-size: 13px;
   color: #c0c4cc;
+}
+
+/* ─── Transform config in expand row ─── */
+.transform-config-area {
+  padding: 12px 16px;
+  background: #fafbfc;
+  border-radius: 4px;
+}
+
+.transform-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: #606266;
+  margin-bottom: 10px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid #ebeef5;
+}
+
+.transform-form {
+  margin-top: 8px;
+}
+
+.transform-block {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+/* ─── Price match rule section ─── */
+.price-match-section {
+  margin-top: 16px;
+  padding: 12px;
+  background: #fffbf0;
+  border: 1px solid #faecd8;
+  border-radius: 6px;
 }
 </style>

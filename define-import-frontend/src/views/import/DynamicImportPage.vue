@@ -33,6 +33,14 @@ function handleFileRemove() {
   rawFile.value = null
 }
 
+function beforeUpload(file) {
+  const isExcel = /\.(xlsx|xls)$/i.test(file.name)
+  const isLt50M = file.size / 1024 / 1024 < 50
+  if (!isExcel) { ElMessage.error('只能上传 .xlsx 或 .xls 文件'); return false }
+  if (!isLt50M) { ElMessage.error('文件大小不能超过 50MB'); return false }
+  return true
+}
+
 async function doImportPreview() {
   if (!selectedTemplateId.value) {
     ElMessage.warning('请先选择模板')
@@ -118,6 +126,7 @@ function errorLevelType(level) {
             :auto-upload="false"
             :limit="1"
             accept=".xlsx,.xls"
+            :before-upload="beforeUpload"
             :on-change="handleFileChange"
             :on-remove="handleFileRemove"
           >

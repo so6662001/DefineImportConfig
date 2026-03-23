@@ -6,6 +6,7 @@ export const templateApi = {
   list: (supplierId) => api.get('/import-template/list', { params: { supplierId } }),
   getById: (id) => api.get(`/import-template/${id}`),
   create: (data) => api.post('/import-template', data),
+  update: (id, data) => api.put(`/import-template/${id}`, data),
   delete: (id) => api.delete(`/import-template/${id}`)
 }
 
