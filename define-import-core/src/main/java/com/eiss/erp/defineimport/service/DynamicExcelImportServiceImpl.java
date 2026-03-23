@@ -1,14 +1,18 @@
 package com.eiss.erp.defineimport.service;
 
 import com.eiss.erp.defineimport.engine.DynamicExcelParser;
+import com.eiss.erp.defineimport.mapper.ImportCharRulePresetMapper;
 import com.eiss.erp.defineimport.mapper.ImportInventoryDataMapper;
 import com.eiss.erp.defineimport.mapper.ImportRecordMapper;
+import com.eiss.erp.defineimport.model.config.CharTransformConfig;
+import com.eiss.erp.defineimport.model.entity.ImportCharRulePreset;
 import com.eiss.erp.defineimport.model.dto.ImportPreviewResult;
 import com.eiss.erp.defineimport.model.dto.ImportTemplateDto;
 import com.eiss.erp.defineimport.model.dto.ParsedRowDto;
 import com.eiss.erp.defineimport.model.entity.ImportInventoryData;
 import com.eiss.erp.defineimport.model.entity.ImportRecord;
 import com.eiss.erp.defineimport.model.enums.ImportStatusEnum;
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -16,7 +20,8 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.io.InputStream;
-import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.UUID;
 
@@ -37,6 +42,9 @@ public class DynamicExcelImportServiceImpl implements DynamicExcelImportService 
     @Autowired
     private ImportInventoryDataMapper inventoryDataMapper;
 
+    @Autowired
+    private ImportCharRulePresetMapper importCharRulePresetMapper;
+
     private final DynamicExcelParser parser = new DynamicExcelParser();
 
     @Override
@@ -46,7 +54,31 @@ public class DynamicExcelImportServiceImpl implements DynamicExcelImportService 
             throw new IllegalArgumentException("模板不存在: " + templateId);
         }
 
-        return parser.parse(fileStream, templateDto);
+        return parser.parse(fileStream, templateDto, loadPresetCharRules());
+    }
+
+    /**
+     * 加载启用的全局字符转换预设，供解析器与模板级、字段级规则合并。
+     */
+    private List<CharTransformConfig.CharRule> loadPresetCharRules() {
+        List<ImportCharRulePreset> presets = importCharRulePresetMapper.selectList(
+                new LambdaQueryWrapper<ImportCharRulePreset>()
+                        .eq(ImportCharRulePreset::getEnabled, 1)
+                        .orderByAsc(ImportCharRulePreset::getSortOrder));
+        if (presets == null || presets.isEmpty()) {
+            return Collections.emptyList();
+        }
+        List<CharTransformConfig.CharRule> rules = new ArrayList<>(presets.size());
+        for (ImportCharRulePreset p : presets) {
+            CharTransformConfig.CharRule r = new CharTransformConfig.CharRule();
+            r.setMatchType(p.getMatchType());
+            r.setMatchPattern(p.getMatchPattern());
+            r.setReplaceValue(p.getReplaceValue());
+            r.setSortOrder(p.getSortOrder());
+            r.setDescription(p.getDescription());
+            rules.add(r);
+        }
+        return rules;
     }
 
     @Override

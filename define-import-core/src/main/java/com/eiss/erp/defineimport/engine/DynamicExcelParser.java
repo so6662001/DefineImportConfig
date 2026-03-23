@@ -44,7 +44,7 @@ public class DynamicExcelParser {
      * @return ImportPreviewResult with parsed rows and errors
      */
     public ImportPreviewResult parse(InputStream inputStream, ImportTemplateDto templateDto) {
-        return parse(inputStream, templateDto, null);
+        return parse(inputStream, templateDto, null, null);
     }
 
     /**
@@ -57,6 +57,39 @@ public class DynamicExcelParser {
      */
     public ImportPreviewResult parse(InputStream inputStream, ImportTemplateDto templateDto,
                                       List<CharTransformConfig.CharRule> presetCharRules) {
+        return parse(inputStream, templateDto, presetCharRules, null);
+    }
+
+    /**
+     * Only sheets with {@link ContentTypeEnum#INVENTORY} are parsed.
+     */
+    public ImportPreviewResult parseInventoryOnly(InputStream inputStream, ImportTemplateDto templateDto) {
+        return parse(inputStream, templateDto, null, ContentTypeEnum.INVENTORY);
+    }
+
+    public ImportPreviewResult parseInventoryOnly(InputStream inputStream, ImportTemplateDto templateDto,
+                                                   List<CharTransformConfig.CharRule> presetCharRules) {
+        return parse(inputStream, templateDto, presetCharRules, ContentTypeEnum.INVENTORY);
+    }
+
+    /**
+     * Only sheets with {@link ContentTypeEnum#PRICE} are parsed.
+     */
+    public ImportPreviewResult parsePriceOnly(InputStream inputStream, ImportTemplateDto templateDto) {
+        return parse(inputStream, templateDto, null, ContentTypeEnum.PRICE);
+    }
+
+    public ImportPreviewResult parsePriceOnly(InputStream inputStream, ImportTemplateDto templateDto,
+                                               List<CharTransformConfig.CharRule> presetCharRules) {
+        return parse(inputStream, templateDto, presetCharRules, ContentTypeEnum.PRICE);
+    }
+
+    /**
+     * @param contentTypeFilter null = full parse (inventory sheets first, then others); non-null = only that type
+     */
+    private ImportPreviewResult parse(InputStream inputStream, ImportTemplateDto templateDto,
+                                      List<CharTransformConfig.CharRule> presetCharRules,
+                                      ContentTypeEnum contentTypeFilter) {
         byte[] fileBytes = toByteArray(inputStream);
 
         List<SheetConfigDto> sheets = templateDto.getSheets();
@@ -89,23 +122,39 @@ public class DynamicExcelParser {
                 .filter(s -> s.getContentType() == null
                         || s.getContentType() != ContentTypeEnum.INVENTORY.getCode())
                 .collect(Collectors.toList());
+        List<SheetConfigDto> priceSheets = sheets.stream()
+                .filter(s -> s.getContentType() != null
+                        && s.getContentType() == ContentTypeEnum.PRICE.getCode())
+                .collect(Collectors.toList());
 
         List<ParsedRowDto> allInventoryRows = new ArrayList<>();
         List<ParsedRowDto> allPriceRows = new ArrayList<>();
         List<ExcelImportError> allErrors = new ArrayList<>();
         DuplicateDetector duplicateDetector = new DuplicateDetector();
 
-        for (SheetConfigDto sheetConfig : inventorySheets) {
-            parseOneSheet(fileBytes, sheetConfig, templateDto, presetCharRules, duplicateDetector,
-                    allInventoryRows, allPriceRows, allErrors);
-        }
-        for (SheetConfigDto sheetConfig : nonInventorySheets) {
-            parseOneSheet(fileBytes, sheetConfig, templateDto, presetCharRules, duplicateDetector,
-                    allInventoryRows, allPriceRows, allErrors);
+        if (contentTypeFilter == null) {
+            for (SheetConfigDto sheetConfig : inventorySheets) {
+                parseOneSheet(fileBytes, sheetConfig, templateDto, presetCharRules, duplicateDetector,
+                        allInventoryRows, allPriceRows, allErrors);
+            }
+            for (SheetConfigDto sheetConfig : nonInventorySheets) {
+                parseOneSheet(fileBytes, sheetConfig, templateDto, presetCharRules, duplicateDetector,
+                        allInventoryRows, allPriceRows, allErrors);
+            }
+        } else if (contentTypeFilter == ContentTypeEnum.INVENTORY) {
+            for (SheetConfigDto sheetConfig : inventorySheets) {
+                parseOneSheet(fileBytes, sheetConfig, templateDto, presetCharRules, duplicateDetector,
+                        allInventoryRows, allPriceRows, allErrors);
+            }
+        } else if (contentTypeFilter == ContentTypeEnum.PRICE) {
+            for (SheetConfigDto sheetConfig : priceSheets) {
+                parseOneSheet(fileBytes, sheetConfig, templateDto, presetCharRules, duplicateDetector,
+                        allInventoryRows, allPriceRows, allErrors);
+            }
         }
 
-        // Price matching: fill prices into inventory rows
-        if (!allInventoryRows.isEmpty() && !allPriceRows.isEmpty()) {
+        // Price matching: fill prices into inventory rows (full parse only)
+        if (contentTypeFilter == null && !allInventoryRows.isEmpty() && !allPriceRows.isEmpty()) {
             PriceMatchRuleDto priceRule = findPriceMatchRule(sheets);
             if (priceRule != null) {
                 List<String> matchFields = priceRule.getMatchFields() != null
@@ -125,7 +174,7 @@ public class DynamicExcelParser {
         }
 
         return buildResult(templateDto.getTemplateName(), sheets,
-                allInventoryRows, allPriceRows, allErrors, duplicateDetector);
+                allInventoryRows, allPriceRows, allErrors, duplicateDetector, contentTypeFilter);
     }
 
     private void parseOneSheet(byte[] fileBytes,
@@ -311,7 +360,8 @@ public class DynamicExcelParser {
                                             List<ParsedRowDto> inventoryRows,
                                             List<ParsedRowDto> priceRows,
                                             List<ExcelImportError> errors,
-                                            DuplicateDetector duplicateDetector) {
+                                            DuplicateDetector duplicateDetector,
+                                            ContentTypeEnum contentTypeFilter) {
         ImportPreviewResult result = new ImportPreviewResult();
         result.setTaskId(UUID.randomUUID().toString().replace("-", ""));
         result.setTemplateName(templateName);
@@ -324,6 +374,12 @@ public class DynamicExcelParser {
 
         int invSheets = 0, priceSheets = 0;
         for (SheetConfigDto s : sheets) {
+            if (contentTypeFilter != null) {
+                int ct = s.getContentType() != null ? s.getContentType() : ContentTypeEnum.INVENTORY.getCode();
+                if (ct != contentTypeFilter.getCode()) {
+                    continue;
+                }
+            }
             if (s.getContentType() != null && s.getContentType() == ContentTypeEnum.INVENTORY.getCode()) {
                 invSheets++;
             } else {
