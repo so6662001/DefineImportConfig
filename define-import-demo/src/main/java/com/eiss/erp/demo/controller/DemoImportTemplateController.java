@@ -3,14 +3,21 @@ package com.eiss.erp.demo.controller;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.eiss.erp.defineimport.mapper.*;
 import com.eiss.erp.defineimport.model.entity.*;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
+
+import org.springframework.transaction.annotation.Transactional;
 
 import java.util.*;
 
 @RestController
 @RequestMapping("/api/v1/import-template")
 public class DemoImportTemplateController {
+
+    private static final Logger log = LoggerFactory.getLogger(DemoImportTemplateController.class);
 
     @Autowired
     private ImportTemplateMapper templateMapper;
@@ -28,11 +35,27 @@ public class DemoImportTemplateController {
     private ImportTemplateCharRuleMapper charRuleMapper;
 
     @PostMapping
+    @Transactional(rollbackFor = Exception.class)
     public Result<?> create(@RequestBody Map<String, Object> dto) {
         try {
+            String templateCode = (String) dto.get("templateCode");
+            String templateName = (String) dto.get("templateName");
+            if (templateCode == null || templateCode.isBlank()) {
+                return Result.fail("模板编码不能为空");
+            }
+            if (templateCode.length() > 64) {
+                return Result.fail("模板编码长度不能超过64个字符");
+            }
+            if (templateName == null || templateName.isBlank()) {
+                return Result.fail("模板名称不能为空");
+            }
+            if (templateName.length() > 128) {
+                return Result.fail("模板名称长度不能超过128个字符");
+            }
+
             ImportTemplate template = new ImportTemplate();
-            template.setTemplateCode((String) dto.get("templateCode"));
-            template.setTemplateName((String) dto.get("templateName"));
+            template.setTemplateCode(templateCode);
+            template.setTemplateName(templateName);
             template.setSupplierId(toLong(dto.get("supplierId")));
             template.setSupplierName((String) dto.get("supplierName"));
             template.setScope((String) dto.get("scope"));
@@ -121,7 +144,121 @@ public class DemoImportTemplateController {
 
             return Result.ok(Map.of("id", templateId));
         } catch (Exception e) {
-            return Result.fail("创建模板失败: " + e.getMessage());
+            log.error("创建模板失败", e);
+            return Result.fail("创建模板失败，请检查输入数据格式");
+        }
+    }
+
+    @PutMapping("/{id}")
+    @Transactional
+    public Result<?> update(@PathVariable Long id, @RequestBody Map<String, Object> dto) {
+        try {
+            ImportTemplate existing = templateMapper.selectById(id);
+            if (existing == null) {
+                return Result.fail("模板不存在");
+            }
+
+            // Delete all existing sub-records
+            sheetMapper.delete(new LambdaQueryWrapper<ImportTemplateSheet>().eq(ImportTemplateSheet::getTemplateId, id));
+            groupMapper.delete(new LambdaQueryWrapper<ImportTemplateGroup>().eq(ImportTemplateGroup::getTemplateId, id));
+            fieldMapper.delete(new LambdaQueryWrapper<ImportTemplateField>().eq(ImportTemplateField::getTemplateId, id));
+            valueMappingMapper.delete(new LambdaQueryWrapper<ImportTemplateFieldValueMapping>().eq(ImportTemplateFieldValueMapping::getTemplateId, id));
+            priceMatchRuleMapper.delete(new LambdaQueryWrapper<ImportTemplatePriceMatchRule>().eq(ImportTemplatePriceMatchRule::getTemplateId, id));
+            charRuleMapper.delete(new LambdaQueryWrapper<ImportTemplateCharRule>().eq(ImportTemplateCharRule::getTemplateId, id));
+
+            // Update the main template record
+            existing.setTemplateCode((String) dto.get("templateCode"));
+            existing.setTemplateName((String) dto.get("templateName"));
+            existing.setSupplierId(toLong(dto.get("supplierId")));
+            existing.setSupplierName((String) dto.get("supplierName"));
+            existing.setScope((String) dto.get("scope"));
+            existing.setAllSheetsPrice(toInt(dto.get("allSheetsPrice"), 0));
+            existing.setStatus(toInt(dto.get("status"), 1));
+            existing.setRemark((String) dto.get("remark"));
+            templateMapper.updateById(existing);
+            Long templateId = id;
+
+            // Re-create sub-records (same logic as create)
+            @SuppressWarnings("unchecked")
+            List<Map<String, Object>> sheets = (List<Map<String, Object>>) dto.get("sheets");
+            if (sheets != null) {
+                for (Map<String, Object> s : sheets) {
+                    ImportTemplateSheet sheet = new ImportTemplateSheet();
+                    sheet.setTemplateId(templateId);
+                    sheet.setSheetIndex(toInt(s.get("sheetIndex"), 0));
+                    sheet.setSheetName((String) s.get("sheetName"));
+                    sheet.setContentType(toInt(s.get("contentType"), 1));
+                    sheet.setHeaderRowIndex(toInt(s.get("headerRowIndex"), 0));
+                    sheet.setDataStartRowIndex(toIntOrNull(s.get("dataStartRowIndex")));
+                    sheet.setDataEndRowIndex(toIntOrNull(s.get("dataEndRowIndex")));
+                    sheet.setEmptyRowThreshold(toInt(s.get("emptyRowThreshold"), 2));
+                    sheet.setEnableMergeCell(toInt(s.get("enableMergeCell"), 1));
+                    sheet.setSortOrder(toInt(s.get("sortOrder"), 0));
+                    sheetMapper.insert(sheet);
+                    Long sheetId = sheet.getId();
+
+                    @SuppressWarnings("unchecked")
+                    List<Map<String, Object>> groups = (List<Map<String, Object>>) s.get("groups");
+                    if (groups != null) {
+                        for (Map<String, Object> g : groups) {
+                            ImportTemplateGroup group = new ImportTemplateGroup();
+                            group.setTemplateId(templateId);
+                            group.setSheetConfigId(sheetId);
+                            group.setGroupSeq(toInt(g.get("groupSeq"), 1));
+                            group.setGroupName((String) g.get("groupName"));
+                            group.setFixedCategory((String) g.get("fixedCategory"));
+                            group.setFixedOrigin((String) g.get("fixedOrigin"));
+                            group.setFixedMaterial((String) g.get("fixedMaterial"));
+                            group.setFixedRemark((String) g.get("fixedRemark"));
+                            group.setDataStartRow(toIntOrNull(g.get("dataStartRow")));
+                            group.setDataEndRow(toIntOrNull(g.get("dataEndRow")));
+                            groupMapper.insert(group);
+                            Long groupId = group.getId();
+
+                            saveFields(templateId, sheetId, groupId, g);
+                            saveValueMappings(templateId, sheetId, groupId, g);
+                        }
+                    }
+
+                    saveFields(templateId, sheetId, null, s);
+                    saveValueMappings(templateId, sheetId, null, s);
+
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> pmr = (Map<String, Object>) s.get("priceMatchRule");
+                    if (pmr != null) {
+                        ImportTemplatePriceMatchRule rule = new ImportTemplatePriceMatchRule();
+                        rule.setTemplateId(templateId);
+                        rule.setSheetConfigId(sheetId);
+                        rule.setMatchFields(toJsonString(pmr.get("matchFields")));
+                        rule.setWallThicknessMatchMode(toInt(pmr.get("wallThicknessMatchMode"), 0));
+                        rule.setSpecRangeMatchMode(toInt(pmr.get("specRangeMatchMode"), 0));
+                        rule.setSpecRangeConfig(toJsonString(pmr.get("specRangeConfig")));
+                        priceMatchRuleMapper.insert(rule);
+                    }
+                }
+            }
+
+            @SuppressWarnings("unchecked")
+            List<Map<String, Object>> charRules = (List<Map<String, Object>>) dto.get("charRules");
+            if (charRules != null) {
+                for (Map<String, Object> cr : charRules) {
+                    ImportTemplateCharRule rule = new ImportTemplateCharRule();
+                    rule.setTemplateId(templateId);
+                    rule.setApplyFieldCodes(toJsonString(cr.get("applyFieldCodes")));
+                    rule.setPresetRuleId(toLong(cr.get("presetRuleId")));
+                    rule.setMatchType((String) cr.get("matchType"));
+                    rule.setMatchPattern((String) cr.get("matchPattern"));
+                    rule.setReplaceValue((String) cr.get("replaceValue"));
+                    rule.setDescription((String) cr.get("description"));
+                    rule.setSortOrder(toInt(cr.get("sortOrder"), 0));
+                    rule.setEnabled(toInt(cr.get("enabled"), 1));
+                    charRuleMapper.insert(rule);
+                }
+            }
+
+            return Result.ok(Map.of("id", templateId));
+        } catch (Exception e) {
+            return Result.fail("更新模板失败: " + e.getMessage());
         }
     }
 
@@ -158,7 +295,8 @@ public class DemoImportTemplateController {
 
             return Result.ok(result);
         } catch (Exception e) {
-            return Result.fail("查询模板失败: " + e.getMessage());
+            log.error("查询模板失败", e);
+            return Result.fail("查询模板失败，请稍后重试");
         }
     }
 
@@ -172,11 +310,13 @@ public class DemoImportTemplateController {
             wrapper.orderByDesc(ImportTemplate::getId);
             return Result.ok(templateMapper.selectList(wrapper));
         } catch (Exception e) {
-            return Result.fail("查询模板列表失败: " + e.getMessage());
+            log.error("查询模板列表失败", e);
+            return Result.fail("查询模板列表失败，请稍后重试");
         }
     }
 
     @DeleteMapping("/{id}")
+    @Transactional(rollbackFor = Exception.class)
     public Result<?> delete(@PathVariable Long id) {
         try {
             templateMapper.deleteById(id);
@@ -188,7 +328,8 @@ public class DemoImportTemplateController {
             charRuleMapper.delete(new LambdaQueryWrapper<ImportTemplateCharRule>().eq(ImportTemplateCharRule::getTemplateId, id));
             return Result.ok("删除成功");
         } catch (Exception e) {
-            return Result.fail("删除模板失败: " + e.getMessage());
+            log.error("删除模板失败", e);
+            return Result.fail("删除模板失败，请稍后重试");
         }
     }
 

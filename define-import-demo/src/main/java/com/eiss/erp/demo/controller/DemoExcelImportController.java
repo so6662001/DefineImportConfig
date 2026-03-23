@@ -8,19 +8,23 @@ import com.eiss.erp.defineimport.mapper.*;
 import com.eiss.erp.defineimport.model.config.*;
 import com.eiss.erp.defineimport.model.dto.*;
 import com.eiss.erp.defineimport.model.entity.*;
-import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.InputStream;
-import java.math.BigDecimal;
 import java.util.*;
 
 @RestController
 @RequestMapping("/api/v1/dynamic-import")
 public class DemoExcelImportController {
+
+    private static final Logger log = LoggerFactory.getLogger(DemoExcelImportController.class);
+
+    private static final long MAX_FILE_BYTES = 50L * 1024 * 1024;
 
     @Autowired
     private ImportTemplateMapper templateMapper;
@@ -41,9 +45,11 @@ public class DemoExcelImportController {
     public Result<?> preview(@RequestParam("file") MultipartFile file,
                               @RequestParam("templateId") Long templateId) {
         try {
+            validateExcelFile(file);
+
             ImportTemplate template = templateMapper.selectById(templateId);
             if (template == null) {
-                return Result.fail("模板不存在: " + templateId);
+                return Result.fail("模板不存在");
             }
 
             List<ImportTemplateSheet> sheets = sheetMapper.selectList(
@@ -55,51 +61,51 @@ public class DemoExcelImportController {
             List<ParsedRowDto> allPriceRows = new ArrayList<>();
             List<ExcelImportError> allErrors = new ArrayList<>();
 
-            try (InputStream is = file.getInputStream()) {
-                for (ImportTemplateSheet sheetConfig : sheets) {
-                    List<ImportTemplateGroup> groups = groupMapper.selectList(
-                            new LambdaQueryWrapper<ImportTemplateGroup>()
-                                    .eq(ImportTemplateGroup::getSheetConfigId, sheetConfig.getId()));
-                    List<ImportTemplateField> fields = fieldMapper.selectList(
-                            new LambdaQueryWrapper<ImportTemplateField>()
-                                    .eq(ImportTemplateField::getSheetConfigId, sheetConfig.getId()));
+            for (ImportTemplateSheet sheetConfig : sheets) {
+                List<ImportTemplateGroup> groups = groupMapper.selectList(
+                        new LambdaQueryWrapper<ImportTemplateGroup>()
+                                .eq(ImportTemplateGroup::getSheetConfigId, sheetConfig.getId()));
+                List<ImportTemplateField> fields = fieldMapper.selectList(
+                        new LambdaQueryWrapper<ImportTemplateField>()
+                                .eq(ImportTemplateField::getSheetConfigId, sheetConfig.getId()));
 
-                    List<Map<Integer, String>> rawData = new ArrayList<>();
-                    final Map<Integer, String>[] headerHolder = new Map[]{null};
+                List<Map<Integer, String>> rawData = new ArrayList<>();
+                final Map<Integer, String>[] headerHolder = new Map[]{null};
 
-                    EasyExcel.read(file.getInputStream(), new PageReadListener<Map<Integer, String>>(dataList -> {
+                try (InputStream in = file.getInputStream()) {
+                    EasyExcel.read(in, new PageReadListener<Map<Integer, String>>(dataList -> {
                         rawData.addAll(dataList);
                     })).sheet(sheetConfig.getSheetIndex())
                             .headRowNumber(sheetConfig.getHeaderRowIndex() + 1)
                             .doRead();
+                }
 
-                    int startRow = sheetConfig.getDataStartRowIndex() != null
-                            ? sheetConfig.getDataStartRowIndex() : sheetConfig.getHeaderRowIndex() + 1;
-                    int contentType = sheetConfig.getContentType() != null ? sheetConfig.getContentType() : 1;
+                int startRow = sheetConfig.getDataStartRowIndex() != null
+                        ? sheetConfig.getDataStartRowIndex() : sheetConfig.getHeaderRowIndex() + 1;
+                int contentType = sheetConfig.getContentType() != null ? sheetConfig.getContentType() : 1;
 
-                    for (int i = 0; i < rawData.size(); i++) {
-                        Map<Integer, String> rowData = rawData.get(i);
-                        int rowIdx = startRow + i + 1;
+                for (int i = 0; i < rawData.size(); i++) {
+                    Map<Integer, String> rowData = rawData.get(i);
+                    int rowIdx = startRow + i + 1;
 
-                        if (rowData == null || rowData.values().stream().allMatch(v -> v == null || v.isBlank())) {
-                            continue;
+                    if (rowData == null || rowData.values().stream().allMatch(v -> v == null || v.isBlank())) {
+                        continue;
+                    }
+
+                    if (groups.isEmpty()) {
+                        ParsedRowDto row = buildRow(rowData, fields, null, sheetConfig, rowIdx, allErrors);
+                        if (contentType == 1) {
+                            allInventoryRows.add(row);
+                        } else {
+                            allPriceRows.add(row);
                         }
-
-                        if (groups.isEmpty()) {
-                            ParsedRowDto row = buildRow(rowData, fields, null, sheetConfig, rowIdx, allErrors);
+                    } else {
+                        for (ImportTemplateGroup group : groups) {
+                            ParsedRowDto row = buildRow(rowData, fields, group, sheetConfig, rowIdx, allErrors);
                             if (contentType == 1) {
                                 allInventoryRows.add(row);
                             } else {
                                 allPriceRows.add(row);
-                            }
-                        } else {
-                            for (ImportTemplateGroup group : groups) {
-                                ParsedRowDto row = buildRow(rowData, fields, group, sheetConfig, rowIdx, allErrors);
-                                if (contentType == 1) {
-                                    allInventoryRows.add(row);
-                                } else {
-                                    allPriceRows.add(row);
-                                }
                             }
                         }
                     }
@@ -122,8 +128,28 @@ public class DemoExcelImportController {
             result.setSummary(summary);
 
             return Result.ok(result);
+        } catch (IllegalArgumentException e) {
+            return Result.fail(e.getMessage());
         } catch (Exception e) {
-            return Result.fail("导入预览失败: " + e.getMessage());
+            log.error("导入预览失败", e);
+            return Result.fail("导入预览失败，请稍后重试");
+        }
+    }
+
+    private void validateExcelFile(MultipartFile file) {
+        if (file == null || file.isEmpty()) {
+            throw new IllegalArgumentException("上传文件不能为空");
+        }
+        if (file.getSize() > MAX_FILE_BYTES) {
+            throw new IllegalArgumentException("文件大小不能超过50MB");
+        }
+        String name = file.getOriginalFilename();
+        if (name == null || name.isBlank()) {
+            throw new IllegalArgumentException("文件名无效，请上传 .xlsx 或 .xls 格式的 Excel 文件");
+        }
+        String lower = name.toLowerCase(Locale.ROOT);
+        if (!lower.endsWith(".xlsx") && !lower.endsWith(".xls")) {
+            throw new IllegalArgumentException("仅支持 .xlsx 或 .xls 格式的 Excel 文件");
         }
     }
 
