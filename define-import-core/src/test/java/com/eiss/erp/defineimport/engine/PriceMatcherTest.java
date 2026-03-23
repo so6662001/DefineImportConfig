@@ -91,4 +91,59 @@ class PriceMatcherTest {
         assertThat(inventory.get(0).getPrice()).isEqualByComparingTo("4500");
         assertThat(inventory.get(1).getPrice()).isEqualByComparingTo("4500");
     }
+
+    @Test
+    void shouldMatchWallThicknessWhenInventoryWithinPriceRange() {
+        List<ParsedRowDto> inventory = new ArrayList<>();
+        ParsedRowDto inv = invRow("管", "20*0.75", "上海");
+        inventory.add(inv);
+
+        List<ParsedRowDto> prices = new ArrayList<>();
+        ParsedRowDto p = priceRow("管", "20*0.75", "上海", new BigDecimal("5000"));
+        p.setWallThickness("0.5-1.0");
+        prices.add(p);
+
+        List<ExcelImportError> errors = PriceMatcher.match(
+                inventory, prices, List.of("category", "spec", "origin"),
+                1, 0, null, "*");
+
+        assertThat(errors).isEmpty();
+        assertThat(inventory.get(0).getPrice()).isEqualByComparingTo("5000");
+    }
+
+    @Test
+    void shouldNotMatchWallThicknessWhenOutsidePriceRange() {
+        List<ParsedRowDto> inventory = new ArrayList<>();
+        inventory.add(invRow("管", "20*5.0", "上海"));
+
+        List<ParsedRowDto> prices = new ArrayList<>();
+        ParsedRowDto p = priceRow("管", "20*5.0", "上海", new BigDecimal("5000"));
+        p.setWallThickness("0.5-1.0");
+        prices.add(p);
+
+        List<ExcelImportError> errors = PriceMatcher.match(
+                inventory, prices, List.of("category", "spec", "origin"),
+                1, 0, null, "*");
+
+        assertThat(errors).hasSize(1);
+        assertThat(inventory.get(0).getPrice()).isNull();
+    }
+
+    @Test
+    void shouldFallBackToEqualityWhenPriceWallThicknessIsSingleValue() {
+        List<ParsedRowDto> inventory = new ArrayList<>();
+        inventory.add(invRow("管", "20*3.0", "上海"));
+
+        List<ParsedRowDto> prices = new ArrayList<>();
+        ParsedRowDto p = priceRow("管", "20*3.0", "上海", new BigDecimal("5000"));
+        p.setWallThickness("3.0");
+        prices.add(p);
+
+        List<ExcelImportError> errors = PriceMatcher.match(
+                inventory, prices, List.of("category", "spec", "origin"),
+                1, 0, null, "*");
+
+        assertThat(errors).isEmpty();
+        assertThat(inventory.get(0).getPrice()).isEqualByComparingTo("5000");
+    }
 }

@@ -4,6 +4,7 @@ import com.eiss.erp.defineimport.model.config.SpecRangeConfig;
 import com.eiss.erp.defineimport.model.dto.ExcelImportError;
 import com.eiss.erp.defineimport.model.dto.ParsedRowDto;
 import com.eiss.erp.defineimport.util.RangeUtil;
+import com.eiss.erp.defineimport.util.SafeConvertUtil;
 import com.eiss.erp.defineimport.util.SpecParseUtil;
 
 import java.math.BigDecimal;
@@ -25,6 +26,8 @@ import java.util.*;
  * </p>
  */
 public class PriceMatcher {
+
+    private static final List<String> WT_RANGE_SEPARATORS = Arrays.asList("-", "~");
 
     private PriceMatcher() {
     }
@@ -133,21 +136,106 @@ public class PriceMatcher {
     }
 
     /**
-     * 壁厚匹配：提取价格行和库存行的壁厚，比较是否相等。
-     * 价格行壁厚可以是区间表达式，库存行壁厚为具体值——只要库存值落在价格区间内即视为匹配。
+     * 壁厚匹配（wallThicknessMatchMode=1）：价格侧可为区间（字段 wall_thickness 或规格末段），
+     * 库存侧为单点值；解析为区间时要求库存壁厚落在闭区间内，否则按单值相等比较。
      */
     private static boolean wallThicknessMatches(ParsedRowDto priceRow, ParsedRowDto invRow,
                                                  String specSeparator) {
-        BigDecimal priceWt = SpecParseUtil.extractWallThickness(priceRow.getSpec(), specSeparator);
-        BigDecimal invWt = SpecParseUtil.extractWallThickness(invRow.getSpec(), specSeparator);
+        BigDecimal invWt = extractInventoryWallThickness(invRow, specSeparator);
+        String priceSource = getPriceWallThicknessSource(priceRow, specSeparator);
 
-        if (priceWt == null && invWt == null) {
-            return true;
+        if (priceSource == null || priceSource.isEmpty()) {
+            BigDecimal priceWt = SpecParseUtil.extractWallThickness(priceRow.getSpec(), specSeparator);
+            if (priceWt == null && invWt == null) {
+                return true;
+            }
+            if (priceWt == null || invWt == null) {
+                return false;
+            }
+            return priceWt.compareTo(invWt) == 0;
         }
-        if (priceWt == null || invWt == null) {
+
+        RangeUtil.Range priceRange = RangeUtil.parseRange(
+                priceSource, WT_RANGE_SEPARATORS, Collections.emptyList(), Collections.emptyList());
+
+        if (priceRange == null) {
+            BigDecimal priceSingle = SpecParseUtil.extractWallThickness(priceRow.getSpec(), specSeparator);
+            if (priceSingle == null) {
+                String num = SafeConvertUtil.extractNumber(priceSource);
+                if (num != null) {
+                    try {
+                        priceSingle = new BigDecimal(num);
+                    } catch (NumberFormatException ignored) {
+                        // fall through
+                    }
+                }
+            }
+            if (priceSingle == null && invWt == null) {
+                return true;
+            }
+            if (priceSingle == null || invWt == null) {
+                return false;
+            }
+            return priceSingle.compareTo(invWt) == 0;
+        }
+
+        if (Double.compare(priceRange.getMin(), priceRange.getMax()) == 0) {
+            BigDecimal pricePt = BigDecimal.valueOf(priceRange.getMin());
+            if (invWt == null) {
+                return false;
+            }
+            return pricePt.compareTo(invWt) == 0;
+        }
+
+        if (invWt == null) {
             return false;
         }
-        return priceWt.compareTo(invWt) == 0;
+        double v = invWt.doubleValue();
+        return priceRange.getMin() <= v && v <= priceRange.getMax();
+    }
+
+    /** 库存行壁厚：优先规格末段，其次 wall_thickness 列中的单值。 */
+    private static BigDecimal extractInventoryWallThickness(ParsedRowDto invRow, String specSeparator) {
+        BigDecimal fromSpec = SpecParseUtil.extractWallThickness(invRow.getSpec(), specSeparator);
+        if (fromSpec != null) {
+            return fromSpec;
+        }
+        String wt = invRow.getWallThickness();
+        if (wt == null || wt.isBlank()) {
+            return null;
+        }
+        RangeUtil.Range r = RangeUtil.parseRange(
+                wt.trim(), WT_RANGE_SEPARATORS, Collections.emptyList(), Collections.emptyList());
+        if (r != null && Double.compare(r.getMin(), r.getMax()) == 0) {
+            return BigDecimal.valueOf(r.getMin());
+        }
+        String num = SafeConvertUtil.extractNumber(wt.trim());
+        if (num == null) {
+            return null;
+        }
+        try {
+            return new BigDecimal(num);
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    /**
+     * 价格行壁厚原文：优先 wall_thickness 列，否则规格中分隔符后的末段。
+     */
+    private static String getPriceWallThicknessSource(ParsedRowDto priceRow, String specSeparator) {
+        if (priceRow.getWallThickness() != null && !priceRow.getWallThickness().isBlank()) {
+            return priceRow.getWallThickness().trim();
+        }
+        if (specSeparator == null || specSeparator.isEmpty() || priceRow.getSpec() == null) {
+            return null;
+        }
+        String spec = priceRow.getSpec();
+        int last = spec.lastIndexOf(specSeparator);
+        if (last < 0) {
+            return null;
+        }
+        return spec.substring(last + specSeparator.length()).trim();
     }
 
     /**
