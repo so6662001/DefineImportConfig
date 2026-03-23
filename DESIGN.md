@@ -1,11 +1,12 @@
 # 钢贸动态 Excel 导入系统 — 详细设计文档
 
-> 版本：v1.4  
-> 技术栈：Java 17 + Spring Boot + Alibaba EasyExcel + MyBatis-Plus + MySQL + Vue 3  
+> 版本：v1.5  
+> 技术栈：Java 17 + Spring Boot + Alibaba EasyExcel + MyBatis-Plus + MySQL + Vue 3 + Redis + RocketMQ/RabbitMQ + MinIO  
 > v1.1 变更：新增「规格特殊符号转换」子系统设计  
 > v1.2 变更：① 品类映射泛化为通用字段值映射 ② 行间继承 ③ 数值提取 ④ 多品类价格分组 ⑤ 场景 6-10  
 > v1.3 变更：新增「规格附带区间后缀解析与匹配」  
 > v1.4 变更：完成 6 项扩展方向的完整设计——智能表头识别、模板自动推荐、模板版本管理、异步导入、数据对账、规则复制  
+> v1.5 变更：万人并发导入架构设计——全链路异步化、分布式文件存储、MQ 削峰填谷、Redis 缓存与进度、Worker 弹性伸缩、数据库读写分离与分表  
 
 ---
 
@@ -2185,33 +2186,552 @@ public class DynamicExcelListener extends AnalysisEventListener<Map<Integer, Cel
 
 ---
 
-## 九、性能优化策略
+## 九、高并发架构设计（支撑万人同时在线导入）— v1.5
 
-### 9.1 大文件处理
+### 9.0 容量目标与约束
 
-| 策略 | 实现方式 |
-|------|---------|
-| SAX 流式读取 | EasyExcel 默认即为 SAX 模式, 内存占用与文件大小无关 |
-| 批量处理 | 每累积 500 行调用一次 batch 处理(校验/转换), 避免 List 无限膨胀 |
-| 合并单元格 O(1) 查找 | `mergeCellMap` 使用 HashMap, key 为 `"rowIndex_colIndex"` |
-| 表头匹配预计算 | `headerColumnMap` 在 `invokeHead()` 中一次性计算, 后续行直接查表 |
-| 固定单元格预读 | 需要的固定单元格值在解析前一次性读取并缓存 |
+| 指标 | 目标值 | 说明 |
+|------|--------|------|
+| 并发用户 | 10,000 | 同时在线触发导入操作 |
+| 峰值导入 TPS | 500~1,000 次/秒 | 提交导入请求（文件上传+任务创建） |
+| 单文件上限 | 50MB / 10万行 | 超出需分片或拒绝 |
+| 任务完成时延 P99 | ≤ 60s（≤5000行） / ≤ 5min（≤10万行） | 从提交到结果可查 |
+| 结果保留 | 24h | 超时自动清理 |
 
-### 9.2 多 Sheet 并行
-
-```
-对于独立的库存 Sheet → 可并行解析
-价格 Sheet 需等待所有库存 Sheet 完成 → 串行在后
-使用 CompletableFuture 或线程池管理并发
-```
-
-### 9.3 内存控制
+### 9.1 整体架构
 
 ```
-- 解析过程中只保留必要字段(ParsedRowDto), 不保留原始 CellData
-- 合并单元格 map 仅存储首格值的字符串, 不存 CellData 对象
-- 单个 Sheet 解析完成后立即释放该 Sheet 的临时数据
+                                   ┌──────────────┐
+                                   │   Nginx/SLB   │
+                                   │  负载均衡+限流  │
+                                   └──────┬───────┘
+                                          │
+                    ┌─────────────────────┼─────────────────────┐
+                    ▼                     ▼                     ▼
+            ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+            │  API Server  │    │  API Server  │    │  API Server  │
+            │   实例 1      │    │   实例 2      │    │   实例 N      │
+            │  (Spring Boot)│    │  (Spring Boot)│    │  (Spring Boot)│
+            │              │    │              │    │              │
+            │ · 文件接收    │    │ · 文件接收    │    │ · 文件接收    │
+            │ · 任务创建    │    │ · 任务创建    │    │ · 任务创建    │
+            │ · 进度查询    │    │ · 进度查询    │    │ · 进度查询    │
+            │ · 模板CRUD   │    │ · 模板CRUD   │    │ · 模板CRUD   │
+            └──────┬───────┘    └──────┬───────┘    └──────┬───────┘
+                   │                   │                   │
+       ┌───────────┼───────────────────┼───────────────────┼────────┐
+       │           ▼                   ▼                   ▼        │
+       │   ┌──────────────────────────────────────────────────┐     │
+       │   │                  MinIO / OSS                      │     │
+       │   │              分布式文件存储                         │     │
+       │   │    (Excel 文件上传后存入, Worker 拉取处理)          │     │
+       │   └──────────────────────────────────────────────────┘     │
+       │                                                            │
+       │   ┌──────────────────────────────────────────────────┐     │
+       │   │             RocketMQ / RabbitMQ                    │     │
+       │   │               消息队列                             │     │
+       │   │                                                    │     │
+       │   │  Topic: import-task-queue                          │     │
+       │   │  ┌─────┬─────┬─────┬─────┬─────┐                 │     │
+       │   │  │ msg │ msg │ msg │ msg │ ... │  ← API投递任务   │     │
+       │   │  └─────┴─────┴─────┴─────┴─────┘                 │     │
+       │   │                                                    │     │
+       │   │  Topic: import-progress (进度事件)                  │     │
+       │   │  Topic: import-result   (完成事件)                  │     │
+       │   └──────────────────────────────────────────────────┘     │
+       │                                                            │
+       │           ▼                   ▼                   ▼        │
+       │   ┌──────────────┐    ┌──────────────┐    ┌──────────────┐│
+       │   │Import Worker │    │Import Worker │    │Import Worker ││
+       │   │   实例 1      │    │   实例 2      │    │   实例 M      ││
+       │   │              │    │              │    │              ││
+       │   │ · 消费任务    │    │ · 消费任务    │    │ · 消费任务    ││
+       │   │ · Excel解析  │    │ · Excel解析  │    │ · Excel解析  ││
+       │   │ · 进度上报    │    │ · 进度上报    │    │ · 进度上报    ││
+       │   │ · 结果写入    │    │ · 结果写入    │    │ · 结果写入    ││
+       │   └──────────────┘    └──────────────┘    └──────────────┘│
+       │                                                            │
+       │   ┌─────────────────────────────────────────────────────┐  │
+       │   │                    Redis Cluster                     │  │
+       │   │                                                      │  │
+       │   │  · 任务进度 (Hash: task:{taskNo})                    │  │
+       │   │  · 模板配置缓存 (String: tpl:{id})                   │  │
+       │   │  · 词库缓存 (Hash: lexicon:all)                     │  │
+       │   │  · 字符规则缓存 (String: charRule:{tplId})           │  │
+       │   │  · 用户限流计数器 (String: rateLimit:{userId})       │  │
+       │   │  · 分布式锁 (SET NX: lock:import:{supplierId})      │  │
+       │   │  · WebSocket 会话路由 (Hash: ws:session:{taskNo})    │  │
+       │   └─────────────────────────────────────────────────────┘  │
+       │                                                            │
+       │   ┌─────────────────────────────────────────────────────┐  │
+       │   │               MySQL (主从集群)                        │  │
+       │   │                                                      │  │
+       │   │  Master ──写──→  import_async_task                   │  │
+       │   │    │              import_record                       │  │
+       │   │    │              import_reconciliation_detail        │  │
+       │   │    ▼                                                  │  │
+       │   │  Slave(s) ──读──→  import_template_*                 │  │
+       │   │                   import_char_rule_preset             │  │
+       │   │                   import_header_lexicon               │  │
+       │   └─────────────────────────────────────────────────────┘  │
+       └────────────────────────────────────────────────────────────┘
 ```
+
+### 9.2 全链路异步化：从同步到"全异步"
+
+v1.4 中异步是可选的（行数>5000才切异步）。v1.5 中**所有导入全部走异步**，同步模式仅保留为小文件的语法糖（内部仍经过队列，只是等待时间短到感知不到）。
+
+```
+用户上传 Excel
+    │
+    ▼
+┌─────────────────────────────────────────────┐
+│ API Server                                   │
+│                                              │
+│  1. 接收 multipart 文件流                     │
+│  2. 流式转存至 MinIO (不落本地磁盘)            │
+│  3. INSERT import_async_task (status=QUEUED)  │
+│  4. 发送 MQ 消息 {taskNo, fileKey, templateId}│
+│  5. 返回 {taskNo, async:true}                │
+│                                              │
+│  耗时: < 500ms (只做文件转存+MQ投递)          │
+└─────────────────────────────────────────────┘
+    │
+    ▼  MQ 消息
+┌─────────────────────────────────────────────┐
+│ Import Worker (消费者)                        │
+│                                              │
+│  1. 消费消息, 获取 {taskNo, fileKey, tplId}   │
+│  2. 从 Redis 加载模板配置(缓存)               │
+│  3. 从 MinIO 下载文件流                       │
+│  4. EasyExcel SAX 流式解析                    │
+│  5. 每 500 行: 写进度至 Redis + 发 MQ 进度事件│
+│  6. 完成: 写结果至 MySQL + 发 MQ 完成事件     │
+│  7. 删除 MinIO 临时文件                       │
+└─────────────────────────────────────────────┘
+    │
+    ▼  MQ 进度/完成事件
+┌─────────────────────────────────────────────┐
+│ API Server (WebSocket 推送层)                 │
+│                                              │
+│  1. 消费 import-progress Topic               │
+│  2. 从 Redis 查询 ws:session:{taskNo}        │
+│     → 找到该用户连接的 API Server 实例         │
+│  3. 推送 WebSocket 消息到前端                  │
+└─────────────────────────────────────────────┘
+```
+
+**关键变化**：API Server 不再执行任何 Excel 解析逻辑——只做接收、转存、投递。所有 CPU/IO 密集型工作由 Worker 独立进程承担。
+
+### 9.3 分布式文件存储 (MinIO/OSS)
+
+#### 为什么不用本地磁盘
+
+| 方案 | 10000并发问题 |
+|------|-------------|
+| 本地磁盘 | API Server 多实例时文件在实例 A，Worker 在实例 B 无法读取 |
+| NFS 共享 | IO 瓶颈，单点故障 |
+| **MinIO/OSS** | 分布式、高可用、原生支持流式上传下载，API Server 和 Worker 均可访问 |
+
+#### 文件生命周期
+
+```
+上传 → MinIO(bucket: import-files)
+  ├─ key: {yyyy}/{MM}/{dd}/{taskNo}/{fileName}
+  ├─ 设置 lifecycle: 24h 后自动删除
+  └─ 设置 content-type: application/octet-stream
+
+API Server:
+  使用 MinIO 的 putObject(stream) 流式上传
+  不将文件写入本地磁盘, 避免磁盘 IO 成为瓶颈
+
+Worker:
+  使用 MinIO 的 getObject(stream) 流式下载
+  直接喂给 EasyExcel, 无需先下载到本地
+```
+
+### 9.4 消息队列削峰填谷
+
+#### Topic 设计
+
+| Topic | 生产者 | 消费者 | 消息量 | 说明 |
+|-------|--------|--------|--------|------|
+| `import-task-queue` | API Server | Import Worker | 峰值 1000/s | 导入任务消息 |
+| `import-progress` | Import Worker | API Server | 峰值 10000/s | 进度更新事件(Worker→前端推送) |
+| `import-result` | Import Worker | API Server + 对账服务 | 与任务量等比 | 任务完成/失败事件 |
+
+#### import-task-queue 消息体
+
+```json
+{
+    "taskNo": "task_20260323_abc123",
+    "fileKey": "2026/03/23/task_20260323_abc123/唐钢库存.xlsx",
+    "templateId": 101,
+    "supplierId": 1001,
+    "userId": "user_001",
+    "priority": 1,
+    "createTime": "2026-03-23T14:30:00"
+}
+```
+
+#### 削峰核心机制
+
+```
+场景: 某一时刻 5000 人同时点击"导入"
+
+API Server (N 台):
+  5000 个请求 → 5000 条 MQ 消息 (耗时 < 500ms/条, 无压力)
+
+MQ 队列:
+  积压 5000 条消息 (RocketMQ 单 Topic 百万级积压无压力)
+
+Import Worker (M 台, 如 20 台):
+  每台 Worker 单线程消费(避免 Excel 解析的内存竞争)
+  20 台并行消费 → 20 条/s 吞吐
+  5000 条消息 → 约 250s(4分钟)消化完毕
+
+  若需更快: 增加 Worker 实例数(弹性伸缩)
+```
+
+#### 消费者重试策略
+
+```
+消费失败(如 Excel 解析异常):
+  1. 第一次重试: 延迟 5s
+  2. 第二次重试: 延迟 30s
+  3. 第三次重试: 延迟 120s
+  4. 第三次仍失败 → 进入死信队列(DLQ)
+  5. 更新 import_async_task.task_status = 3(失败)
+  6. 通知用户
+```
+
+### 9.5 Redis 缓存层
+
+#### 缓存策略一览
+
+| Key 模式 | 类型 | TTL | 用途 | 写入时机 |
+|---------|------|-----|------|---------|
+| `tpl:config:{templateId}` | String(JSON) | 30min | 模板完整配置 | 模板首次使用时/修改后淘汰 |
+| `tpl:charPipeline:{templateId}:{fieldCode}` | String(JSON) | 30min | 字符转换管道 | 首次构建后缓存 |
+| `charRule:preset:{group}` | String(JSON) | 1h | 系统预置字符规则 | 应用启动/规则修改后淘汰 |
+| `lexicon:all` | Hash | 1h | 智能识别词库 | 应用启动/词库修改后淘汰 |
+| `task:progress:{taskNo}` | Hash | 25h | 任务进度 | Worker每500行写入 |
+| `task:result:{taskNo}` | String(JSON) | 25h | 任务结果(小结果) | 任务完成时写入 |
+| `ws:route:{taskNo}` | String | 25h | WebSocket会话路由(哪台API Server) | WS连接时写入 |
+| `rateLimit:import:{userId}` | String(计数器) | 60s | 每用户每分钟导入次数限制 | 每次导入请求 |
+| `lock:supplier:import:{supplierId}` | String(分布式锁) | 300s | 同一供应商串行导入锁 | 可选, 防同供应商数据冲突 |
+
+#### 任务进度 Redis Hash 结构
+
+```
+HSET task:progress:{taskNo}
+  status          "PARSING"
+  percent         45
+  detail          "正在解析Sheet'库存' 第2250/5000行"
+  parsedRows      2250
+  successRows     2230
+  errorRows       3
+  currentSheet    "库存"
+  startedAt       "2026-03-23T14:30:05"
+  updatedAt       "2026-03-23T14:30:18"
+```
+
+Worker 进度上报（替代原来的直接 UPDATE 数据库）：
+
+```
+原方案(v1.4): 每500行 → UPDATE MySQL import_async_task
+问题: 10000任务并发, 每个任务平均20次UPDATE → 200,000次DB写入
+瓶颈: MySQL 写入成为热点
+
+新方案(v1.5): 每500行 → HSET Redis (微秒级, 无压力)
+             任务完成时 → 一次性 UPDATE MySQL (仅1次/任务)
+```
+
+#### 模板配置缓存
+
+```java
+// 缓存加载伪代码(Worker 侧)
+public ImportTemplateDto loadTemplate(Long templateId) {
+    String cacheKey = "tpl:config:" + templateId;
+    String json = redis.get(cacheKey);
+    if (json != null) {
+        return JSON.parseObject(json, ImportTemplateDto.class);
+    }
+    // 缓存未命中, 从 DB 加载
+    ImportTemplateDto dto = templateService.loadFullConfig(templateId);
+    redis.setex(cacheKey, 1800, JSON.toJSONString(dto)); // 30min
+    return dto;
+}
+
+// 模板修改时淘汰缓存
+public void onTemplateUpdated(Long templateId) {
+    redis.del("tpl:config:" + templateId);
+    // 同时淘汰该模板的字符管道缓存
+    redis.del(redis.keys("tpl:charPipeline:" + templateId + ":*"));
+}
+```
+
+### 9.6 Import Worker 设计
+
+#### Worker 进程模型
+
+```
+每个 Worker 进程:
+  ├─ 1 个 MQ 消费者线程 (从 import-task-queue 拉取消息)
+  ├─ 1 个解析线程 (执行 EasyExcel 解析, CPU/IO密集)
+  └─ 1 个进度上报线程 (定时将进度批量刷入 Redis)
+
+设计原则:
+  · 单 Worker 同一时刻只处理 1 个导入任务(避免内存竞争)
+  · 通过增加 Worker 实例数实现水平扩容
+  · Worker 无状态, 可随时启停
+```
+
+#### 并发容量计算
+
+```
+假设:
+  · 平均文件 3000 行
+  · EasyExcel 解析速度 ≈ 5000 行/秒(含业务逻辑)
+  · 平均任务耗时 ≈ 1s(解析) + 0.5s(结果写入) = 1.5s/任务
+  · Worker 单实例吞吐 ≈ 0.67 任务/秒
+
+目标: 10000 个并发请求在 5 分钟内消化完毕:
+  需要吞吐 = 10000 / 300s ≈ 34 任务/秒
+  需要 Worker 数 = 34 / 0.67 ≈ 51 台
+
+预留余量: 部署 60~80 个 Worker 实例
+  (可使用 K8s HPA 根据队列积压数自动伸缩)
+```
+
+#### Worker 内存控制
+
+```
+每个 Worker JVM 配置:
+  -Xmx512m -Xms512m  (单任务不需要大堆)
+
+内存使用估算(单任务):
+  · EasyExcel SAX 解析器: ~20MB
+  · mergeCellMap (10万行): ~30MB
+  · parsedRows 中间结果: ~50MB (10万行 * 每行500B)
+  · 模板配置缓存: ~1MB
+  · 其他开销: ~50MB
+  合计: ≤ 200MB, 512MB 堆绰绰有余
+
+大文件保护:
+  · 行数超过 100,000 → 拒绝 (返回错误提示分批上传)
+  · 文件大小超过 50MB → 拒绝
+  · 解析过程中 parsedRows 超过 50,000 → 批量 flush 到 DB, 清空内存
+```
+
+### 9.7 WebSocket 万人推送
+
+#### 挑战
+
+10000 个前端同时监听导入进度，每秒可能有数千条进度更新。API Server 是多实例的，WebSocket 连接分散在不同实例上。
+
+#### 解决方案：MQ 广播 + Redis 路由
+
+```
+用户浏览器 ←WebSocket→ API Server 实例 A
+                            │
+                            │ 1. 连接建立时:
+                            │    HSET ws:route:{taskNo} serverId "A"
+                            │
+Worker 完成进度上报 ──MQ──→ import-progress Topic
+                            │
+                            │ 2. 所有 API Server 实例消费 MQ:
+                            │    读取 ws:route:{taskNo} → "A"
+                            │    若本实例 == "A" → 推送 WebSocket
+                            │    若本实例 != "A" → 忽略
+```
+
+#### WebSocket 降级
+
+```
+优先: WebSocket 推送 (实时, 低延迟)
+降级: SSE (Server-Sent Events, 单向推送, 兼容性更好)
+兜底: HTTP 轮询 (前端每 2s 调 GET /progress, 从 Redis 读取)
+```
+
+#### 连接数压力
+
+```
+10000 WebSocket 连接 / N 台 API Server
+若 N = 5 → 每台 2000 连接 (Spring WebSocket + Netty 轻松支撑)
+若 N = 10 → 每台 1000 连接
+
+Nginx 配置:
+  worker_connections 65535;
+  proxy_http_version 1.1;
+  proxy_set_header Upgrade $http_upgrade;
+  proxy_set_header Connection "upgrade";
+```
+
+### 9.8 数据库优化
+
+#### 读写分离
+
+```
+写入(Master):
+  · import_async_task (INSERT 1次/任务, UPDATE 1次/任务完成)
+  · import_record (INSERT)
+  · import_reconciliation_detail (批量INSERT)
+
+读取(Slave):
+  · import_template_* (模板配置读取, 但优先走 Redis 缓存)
+  · import_char_rule_preset (走缓存)
+  · import_header_lexicon (走缓存)
+  · import_async_task (进度查询, 但优先走 Redis)
+
+效果:
+  写入集中在 Master, 且通过 Redis 缓存大幅减少读 Slave 的压力
+  10000 并发的 DB 写入量 ≈ 10000(任务创建) + 10000(任务完成) = 20000次
+  分散在 5 分钟内 ≈ 67次/秒, MySQL 轻松承受
+```
+
+#### import_async_task 表优化
+
+```sql
+-- 添加索引优化查询
+ALTER TABLE `import_async_task`
+  ADD KEY `idx_status_create` (`task_status`, `create_time`),
+  ADD KEY `idx_user_create` (`create_by`, `create_time`);
+
+-- 历史数据归档(定时任务, 每日凌晨)
+-- 将 7 天前的已完成/已失败任务转移到 import_async_task_archive 表
+-- 保持主表数据量可控
+```
+
+#### import_reconciliation_detail 分表策略
+
+```
+当对账明细量级增长到百万级:
+  按 reconciliation_id 范围分表
+  或按 create_time 按月分表: import_reconciliation_detail_202603
+
+MyBatis-Plus 动态表名插件:
+  DynamicTableNameInnerInterceptor
+  根据查询条件自动路由到对应分表
+```
+
+### 9.9 限流与反压
+
+#### API 层限流
+
+```yaml
+# Nginx 限流
+limit_req_zone $binary_remote_addr zone=import:10m rate=10r/s;
+
+location /api/v1/dynamic-import/preview {
+    limit_req zone=import burst=20 nodelay;
+}
+```
+
+```java
+// Spring 侧: 基于 Redis 的用户级限流
+@RateLimiter(key = "'import:' + #userId", rate = 5, interval = 60)
+public Result submitImport(String userId, MultipartFile file, Long templateId) {
+    // 每用户每分钟最多 5 次导入
+}
+```
+
+#### MQ 消费者反压
+
+```
+Worker 消费策略:
+  · prefetchCount = 1 (RabbitMQ) / pullBatchSize = 1 (RocketMQ)
+  · 每次只拉取 1 条消息, 处理完才拉下一条
+  · 队列积压时: Worker 自然形成反压, 消息不丢失
+
+队列监控告警:
+  · 积压超过 5000 条 → WARNING (可能需要扩容 Worker)
+  · 积压超过 20000 条 → CRITICAL (自动触发 K8s HPA 扩容)
+```
+
+#### 全局熔断
+
+```
+当系统负载过高时的降级策略:
+  1. API Server CPU > 80% → 拒绝新请求, 返回 429 Too Many Requests
+  2. MQ 积压 > 20000 → 前端展示"系统繁忙, 请稍后重试"
+  3. Redis 响应 > 100ms → 降级为直写 MySQL (进度上报)
+  4. MinIO 不可用 → 回退为本地临时文件 + NFS
+```
+
+### 9.10 单任务级性能保留
+
+以上为系统级并发设计。单个任务内部的解析性能优化仍然有效：
+
+| 策略 | 实现方式 | 影响范围 |
+|------|---------|---------|
+| SAX 流式读取 | EasyExcel 默认 SAX 模式 | 单任务内存 |
+| 批量 flush | 每 500 行 batch 处理 | 单任务内存 |
+| 合并单元格 O(1) | HashMap 查找 | 单任务 CPU |
+| 表头匹配预计算 | invokeHead 一次性计算 | 单任务 CPU |
+| 固定单元格预读 | 缓存到 Map | 单任务 IO |
+| 字符规则 Pipeline 缓存 | 按 (templateId, fieldCode) 缓存 | 单任务 CPU |
+| 正则 Pattern 预编译 | Pattern 对象复用 | 单任务 CPU |
+| 多 Sheet 并行 | CompletableFuture(库存Sheet) | 单任务吞吐 |
+
+### 9.11 部署架构参考
+
+#### 最小部署（开发/测试环境）
+
+```
+1 台 API Server + 1 台 Worker + 1 台 Redis + 1 台 MySQL + 1 台 MinIO
+支撑: ~100 并发
+```
+
+#### 标准部署（生产环境）
+
+```
+3 台 API Server (4C8G)
+10 台 Import Worker (2C4G)
+3 节点 Redis Cluster
+1 主 2 从 MySQL
+3 节点 MinIO Cluster
+3 节点 RocketMQ Cluster
+支撑: ~3,000 并发
+```
+
+#### 高性能部署（万人并发）
+
+```
+5~10 台 API Server (4C8G)
+60~80 台 Import Worker (2C4G, K8s HPA 自动伸缩)
+6 节点 Redis Cluster (3主3从)
+1 主 3 从 MySQL (SSD, 读写分离)
+4 节点 MinIO Cluster (SSD)
+5 节点 RocketMQ Cluster
+1 台 Nginx/SLB (或云厂商 LB)
+支撑: 10,000+ 并发
+
+K8s HPA 配置:
+  Worker Deployment:
+    minReplicas: 10
+    maxReplicas: 100
+    metrics:
+      - type: External
+        external:
+          metricName: mq_queue_depth
+          targetAverageValue: 50   # 每个 Worker 积压 50 条时触发扩容
+```
+
+### 9.12 监控指标
+
+| 指标 | 采集方式 | 告警阈值 |
+|------|---------|---------|
+| MQ 队列积压数 | MQ Dashboard / Prometheus | > 5000 WARNING, > 20000 CRITICAL |
+| Worker 活跃数 | K8s metrics | < minReplicas CRITICAL |
+| 任务平均耗时 P99 | Prometheus histogram | > 300s WARNING |
+| 任务失败率 | import_async_task 统计 | > 5% WARNING |
+| Redis 命中率 | Redis INFO | < 80% WARNING |
+| API Server 请求延迟 P99 | Prometheus | > 2s WARNING |
+| MinIO 上传延迟 P99 | MinIO metrics | > 5s WARNING |
+| MySQL 主库 QPS | MySQL metrics | > 5000 WARNING |
+| WebSocket 连接数 | Spring Actuator | 单实例 > 5000 WARNING |
+| JVM 堆内存使用率 | JMX / Actuator | > 85% WARNING |
 
 ---
 
@@ -3178,6 +3698,8 @@ CREATE TABLE `import_template_version` (
 ---
 
 ### 15.4 异步导入
+
+> **注**：v1.5 已将异步导入升级为「全链路异步 + MQ 削峰 + Worker 集群」架构，详见**第九章**。本节保留原始设计作为单机部署的简化方案参考。
 
 #### 15.4.1 业务目标
 
