@@ -1,10 +1,11 @@
 # 钢贸动态 Excel 导入系统 — 详细设计文档
 
-> 版本：v1.3  
+> 版本：v1.4  
 > 技术栈：Java 17 + Spring Boot + Alibaba EasyExcel + MyBatis-Plus + MySQL + Vue 3  
 > v1.1 变更：新增「规格特殊符号转换」子系统设计  
 > v1.2 变更：① 品类映射泛化为通用字段值映射 ② 行间继承 ③ 数值提取 ④ 多品类价格分组 ⑤ 场景 6-10  
-> v1.3 变更：新增「规格附带区间后缀解析与匹配」——支持 `5#（10-15）` vs `5#(10以上)` 的基础规格拆分与区间包含匹配  
+> v1.3 变更：新增「规格附带区间后缀解析与匹配」  
+> v1.4 变更：完成 6 项扩展方向的完整设计——智能表头识别、模板自动推荐、模板版本管理、异步导入、数据对账、规则复制  
 
 ---
 
@@ -2702,11 +2703,1009 @@ public class SafeConvertUtil {
 
 ---
 
-## 十五、后续扩展方向
+## 十五、扩展功能详细设计 — v1.4
 
-1. **智能表头识别**: 基于机器学习自动识别表头行位置和列含义
-2. **模板自动推荐**: 上传 Excel 后自动匹配最接近的已有模板
-3. **模板版本管理**: 同一模板多版本, 支持回滚
-4. **异步导入**: 大文件使用消息队列异步处理, 进度实时推送
-5. **数据对账**: 导入后与历史数据对比, 发现价格异动
-6. **规则复制**: 从已有模板快速复制规则到新模板
+---
+
+### 15.1 智能表头识别
+
+#### 15.1.1 业务目标
+
+运营人员在模板设计器中上传一个全新的 Excel 时，系统自动识别：
+1. **表头行位置**（哪一行是真正的列标题行）
+2. **列含义推断**（哪一列是"规格"、哪一列是"产地"等）
+3. **内容类型推断**（当前 Sheet 是库存还是价格）
+
+运营人员可在推荐结果的基础上微调，而非从零配置。
+
+#### 15.1.2 数据库设计
+
+```sql
+-- ============================================================
+-- 表头识别词库表(可在线维护, 作为识别的知识库)
+-- ============================================================
+CREATE TABLE `import_header_lexicon` (
+    `id`            BIGINT          NOT NULL AUTO_INCREMENT  COMMENT '主键',
+    `field_code`    VARCHAR(64)     NOT NULL                 COMMENT '业务字段编码: category/spec/origin/...',
+    `keyword`       VARCHAR(128)    NOT NULL                 COMMENT '关键词(如: 规格/型号/SIZE)',
+    `weight`        DECIMAL(5,2)    NOT NULL DEFAULT 1.00    COMMENT '权重(0-10, 越高越可信)',
+    `match_mode`    VARCHAR(32)     NOT NULL DEFAULT 'EXACT' COMMENT '匹配模式: EXACT-精确/CONTAINS-包含/REGEX-正则',
+    `enabled`       TINYINT         NOT NULL DEFAULT 1,
+    `create_time`   DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `update_time`   DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    `deleted`       TINYINT         NOT NULL DEFAULT 0,
+    PRIMARY KEY (`id`),
+    KEY `idx_field_code` (`field_code`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='表头识别词库表';
+
+-- 初始化数据示例
+INSERT INTO `import_header_lexicon` (`field_code`, `keyword`, `weight`, `match_mode`) VALUES
+('category',    '品类',      10,  'EXACT'),
+('category',    '品名',      9,   'EXACT'),
+('category',    '产品名称',   9,   'EXACT'),
+('category',    '钢种',      7,   'EXACT'),
+('category',    '品种',      8,   'EXACT'),
+('spec',        '规格',      10,  'EXACT'),
+('spec',        '型号',      9,   'EXACT'),
+('spec',        '规格型号',   10,  'EXACT'),
+('spec',        'SIZE',      6,   'EXACT'),
+('spec',        '尺寸',      7,   'EXACT'),
+('origin',      '产地',      10,  'EXACT'),
+('origin',      '厂家',      8,   'EXACT'),
+('origin',      '钢厂',      8,   'EXACT'),
+('origin',      '生产厂家',   9,   'EXACT'),
+('material',    '材质',      10,  'EXACT'),
+('material',    '钢号',      7,   'EXACT'),
+('material',    '牌号',      7,   'EXACT'),
+('package_num', '包装数量',   10,  'EXACT'),
+('package_num', '件数',      8,   'EXACT'),
+('package_num', '支/件',     8,   'CONTAINS'),
+('package_num', '包装形式',   7,   'EXACT'),
+('weight',      '重量',      10,  'EXACT'),
+('weight',      '吨位',      8,   'EXACT'),
+('weight',      '数量(吨)',   9,   'CONTAINS'),
+('weight',      '过磅重量',   8,   'EXACT'),
+('price',       '单价',      10,  'EXACT'),
+('price',       '价格',      9,   'EXACT'),
+('price',       '含税价',    8,   'EXACT'),
+('price',       '报价',      8,   'EXACT'),
+('remark',      '备注',      10,  'EXACT'),
+('remark',      '说明',      7,   'EXACT');
+```
+
+#### 15.1.3 后端架构
+
+```
+com.eiss.erp.defineimport.intellect
+├── HeaderRecognizer.java              // 表头识别器(总入口)
+├── HeaderRowDetector.java             // 表头行定位器
+├── ColumnMeaningInferrer.java         // 列含义推断器
+├── ContentTypeInferrer.java           // 内容类型推断器(库存/价格)
+└── RecognitionResult.java             // 识别结果 DTO
+```
+
+#### 15.1.4 核心算法
+
+##### 表头行定位 (HeaderRowDetector)
+
+```
+输入: Sheet 的前 N 行数据(默认 N=10)
+输出: 最可能的表头行索引
+
+算法:
+  对每行 row[i] 计算"表头得分" score[i]:
+
+  1. 文本占比得分 (0-30分):
+     textRatio = 非空文本单元格数 / 总非空单元格数
+     若 textRatio > 0.7 → +30
+
+  2. 关键词命中得分 (0-50分):
+     hitCount = row[i] 中命中 import_header_lexicon 词库的单元格数
+     score += hitCount * (50 / 总列数)
+
+  3. 下一行数值占比得分 (0-20分):
+     若 row[i+1] 中数值型单元格占比 > 0.3 → +20
+     (表头下一行通常是数据, 含有数值)
+
+  4. 惩罚项:
+     若 row[i] 仅有 1-2 个非空格(可能是提示文案) → -20
+     若 row[i] 是合并单元格且只有一个值 → -15
+
+  取 score 最高的行作为表头行
+  若最高 score < 30 → 返回 null(无法识别, 需人工指定)
+```
+
+##### 列含义推断 (ColumnMeaningInferrer)
+
+```
+输入: 表头行的所有单元格文本
+输出: Map<Integer colIndex, FieldSuggestion>
+
+算法:
+  对每个非空表头单元格 header[j]:
+    1. 在 import_header_lexicon 中查找匹配:
+       - EXACT: header[j].trim() == keyword
+       - CONTAINS: header[j].contains(keyword)
+       - REGEX: Pattern.matches(keyword, header[j])
+    2. 收集所有命中的 (field_code, weight) 对
+    3. 按 weight 降序, 取 top-1 作为推荐字段
+    4. 若同一 field_code 被多列命中, 取 weight 最高的列
+
+  输出 FieldSuggestion:
+    { colIndex, fieldCode, fieldName, confidence(0-100), matchedKeyword }
+```
+
+##### 内容类型推断 (ContentTypeInferrer)
+
+```
+算法:
+  1. Sheet 名称包含"价格"/"报价"/"price" → PRICE (置信度 90%)
+  2. 表头列中存在"单价"/"价格"/"报价"关键词:
+     a. 若同时存在"重量"/"件数" → INVENTORY (库存表中也可能有单价列)
+     b. 若不存在"重量"/"件数" → PRICE (置信度 70%)
+  3. 表头列中存在"重量"/"件数"/"包装" → INVENTORY (置信度 80%)
+  4. 无法判断 → UNKNOWN, 需用户选择
+```
+
+#### 15.1.5 API 接口
+
+```
+POST /api/v1/intellect/recognize
+  Request: { fileId, sheetIndex }
+  Response: {
+    headerRowIndex: 2,
+    headerConfidence: 85,
+    contentType: "INVENTORY",
+    contentTypeConfidence: 90,
+    columns: [
+      { colIndex: 0, fieldCode: "category", fieldName: "品类", confidence: 95, matchedKeyword: "品名" },
+      { colIndex: 1, fieldCode: "spec", fieldName: "规格", confidence: 100, matchedKeyword: "规格" },
+      { colIndex: 2, fieldCode: "origin", fieldName: "产地", confidence: 90, matchedKeyword: "钢厂" },
+      { colIndex: 5, fieldCode: null, fieldName: null, confidence: 0, headerText: "编号" }
+    ]
+  }
+```
+
+#### 15.1.6 前端交互
+
+```
+1. 用户在模板设计器上传 Excel, 选择某 Sheet
+2. 系统自动调用 /recognize 接口
+3. 右侧配置面板弹出「智能识别结果」卡片:
+   ┌──────────────────────────────────────┐
+   │ 🔍 智能识别结果          [应用] [忽略] │
+   │                                      │
+   │ 表头行: 第 3 行 (置信度 85%)          │
+   │ 类型:   库存 (置信度 90%)             │
+   │                                      │
+   │ 列映射推荐:                           │
+   │  A列 "品名"     → 品类 (95%) ☑       │
+   │  B列 "规格"     → 规格 (100%) ☑      │
+   │  C列 "钢厂"     → 产地 (90%) ☑       │
+   │  D列 "材质"     → 材质 (85%) ☑       │
+   │  E列 "件数"     → 包装数量 (80%) ☑   │
+   │  F列 "编号"     → ？(未识别) ☐       │
+   │                                      │
+   │ 可逐项勾选/取消, 点击[应用]批量填充    │
+   └──────────────────────────────────────┘
+4. 用户点击 [应用] → 自动填充 headerRowIndex + 各字段映射
+5. 用户可在此基础上微调
+```
+
+#### 15.1.7 学习闭环
+
+```
+每次用户保存模板时, 记录实际使用的表头关键词:
+  1. 若词库中已有该关键词 → weight += 0.1 (最高不超过 10)
+  2. 若词库中没有 → 自动新增一条 (weight=5.0)
+  3. 若用户拒绝了推荐 → 对应 keyword 的 weight -= 0.2 (最低不低于 0)
+
+长期运行后, 词库会越来越准确。
+```
+
+---
+
+### 15.2 模板自动推荐
+
+#### 15.2.1 业务目标
+
+用户上传 Excel 后，系统自动从所有已保存的模板中找出"最可能适用"的模板，按匹配度排序推荐。用户可一键选用而非手动翻找。
+
+#### 15.2.2 数据库设计
+
+```sql
+-- ============================================================
+-- 模板指纹表(用于快速匹配, 每次模板保存时生成)
+-- ============================================================
+CREATE TABLE `import_template_fingerprint` (
+    `id`                BIGINT          NOT NULL AUTO_INCREMENT  COMMENT '主键',
+    `template_id`       BIGINT          NOT NULL                 COMMENT '模板ID',
+    `sheet_count`       INT             NOT NULL DEFAULT 1       COMMENT 'Sheet页数量',
+    `sheet_names_hash`  VARCHAR(64)     DEFAULT NULL             COMMENT 'Sheet页名称组合的哈希值',
+    `header_keywords`   JSON            NOT NULL                 COMMENT '所有Sheet表头关键词集合(去重)',
+    `column_count_sig`  VARCHAR(256)    DEFAULT NULL             COMMENT '各Sheet列数签名 如"12,8,5"',
+    `content_type_sig`  VARCHAR(64)     DEFAULT NULL             COMMENT '内容类型签名 如"INV,PRICE"',
+    `supplier_id`       BIGINT          DEFAULT NULL             COMMENT '供应商ID(优先匹配同供应商)',
+    `create_time`       DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `update_time`       DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_template_id` (`template_id`),
+    KEY `idx_supplier_id` (`supplier_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='模板指纹表';
+```
+
+#### 15.2.3 核心算法
+
+```
+输入: 上传的 Excel 文件 + 可选的 supplierId
+输出: List<TemplateMatchResult> 按 score 降序排列
+
+算法:
+  1. 提取上传文件的特征:
+     a. sheetCount = Sheet 页数量
+     b. sheetNames = 各 Sheet 名称列表
+     c. headerKeywords = 对每个 Sheet 读取前 10 行, 提取文本关键词集合
+     d. columnCounts = 各 Sheet 列数
+     e. contentTypeGuess = 按 Sheet 名推断内容类型
+
+  2. 从 import_template_fingerprint 表加载所有启用模板的指纹
+
+  3. 对每个模板指纹计算匹配得分 (0-100):
+
+     a. 供应商匹配 (0-25分):
+        若 supplierId 相同 → +25
+        若 supplierId 不同但非空 → +0
+        若模板未绑定供应商 → +5
+
+     b. Sheet 结构匹配 (0-25分):
+        sheetCount 相同 → +10
+        sheetNames Jaccard 相似度 * 15
+
+     c. 表头关键词匹配 (0-35分):
+        keyword Jaccard 相似度 = |交集| / |并集|
+        score += similarity * 35
+
+     d. 列数匹配 (0-15分):
+        对各 Sheet 列数差异计算:
+        deviation = avg(|upload.colCount[i] - tpl.colCount[i]|)
+        若 deviation == 0 → +15
+        若 deviation <= 2 → +10
+        若 deviation <= 5 → +5
+
+  4. 按 score 降序排列, 取 top-5 返回
+  5. 若 top-1 的 score < 30 → 标记为"无高置信推荐"
+```
+
+#### 15.2.4 API 接口
+
+```
+POST /api/v1/template-recommend
+  Request: multipart/form-data { file, supplierId? }
+  Response: {
+    recommendations: [
+      {
+        templateId: 101,
+        templateCode: "TPL_TANGSHAN_001",
+        templateName: "唐钢库存+价格模板",
+        supplierName: "唐山钢铁",
+        matchScore: 92,
+        matchDetails: {
+          supplierMatch: true,
+          sheetCountMatch: true,
+          keywordSimilarity: 0.85,
+          columnDeviation: 1
+        }
+      },
+      { templateId: 203, matchScore: 67, ... },
+      { templateId: 305, matchScore: 45, ... }
+    ],
+    bestMatch: { templateId: 101, matchScore: 92, confidence: "HIGH" }
+  }
+```
+
+#### 15.2.5 前端交互
+
+```
+用户在「导入页面」上传 Excel 后:
+
+┌───────────────────────────────────────────────────┐
+│  📎 已上传: 唐钢2026年3月库存.xlsx                   │
+│                                                    │
+│  系统推荐以下模板:                                   │
+│  ┌─────────────────────────────────────────────┐   │
+│  │ ★ 唐钢库存+价格模板        匹配度: 92%  [选用] │   │
+│  │   供应商: 唐山钢铁 | Sheet结构一致 | 表头高度吻合│   │
+│  ├─────────────────────────────────────────────┤   │
+│  │   邯钢库存模板              匹配度: 67%  [选用] │   │
+│  ├─────────────────────────────────────────────┤   │
+│  │   通用库存模板              匹配度: 45%  [选用] │   │
+│  └─────────────────────────────────────────────┘   │
+│                                                    │
+│  或 [手动选择模板 ▼]                                │
+└───────────────────────────────────────────────────┘
+```
+
+---
+
+### 15.3 模板版本管理
+
+#### 15.3.1 业务目标
+
+同一供应商的 Excel 格式可能随时间变化。运营修改模板后，若新格式有误需要回滚到历史版本。需要支持：
+1. 模板的每次保存自动生成版本快照
+2. 查看版本历史与差异
+3. 回滚到指定版本
+4. 标记当前生效版本
+
+#### 15.3.2 数据库设计
+
+```sql
+-- ============================================================
+-- 模板版本快照表
+-- ============================================================
+CREATE TABLE `import_template_version` (
+    `id`                BIGINT          NOT NULL AUTO_INCREMENT  COMMENT '主键',
+    `template_id`       BIGINT          NOT NULL                 COMMENT '模板ID',
+    `version_no`        INT             NOT NULL                 COMMENT '版本号(从1递增)',
+    `version_tag`       VARCHAR(64)     DEFAULT NULL             COMMENT '版本标签(如"v2-新增壁厚列")',
+    `snapshot_data`     LONGTEXT        NOT NULL                 COMMENT '模板完整配置快照(JSON, 含所有子表数据)',
+    `change_summary`    VARCHAR(512)    DEFAULT NULL             COMMENT '变更摘要(自动生成或用户填写)',
+    `is_current`        TINYINT         NOT NULL DEFAULT 0       COMMENT '是否为当前生效版本 0-否 1-是',
+    `create_by`         VARCHAR(64)     DEFAULT NULL             COMMENT '保存人',
+    `create_time`       DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '保存时间',
+    PRIMARY KEY (`id`),
+    KEY `idx_template_id` (`template_id`),
+    UNIQUE KEY `uk_template_version` (`template_id`, `version_no`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='模板版本快照表';
+```
+
+#### 15.3.3 snapshot_data JSON 结构
+
+```json
+{
+    "template": { /* import_template 主表全部字段 */ },
+    "sheets": [
+        {
+            "sheet": { /* import_template_sheet 全部字段 */ },
+            "groups": [
+                {
+                    "group": { /* import_template_group 全部字段 */ },
+                    "fields": [ /* import_template_field 列表 */ ],
+                    "fieldValueMappings": [ /* import_template_field_value_mapping 列表 */ ]
+                }
+            ],
+            "priceMatchRule": { /* import_template_price_match_rule */ }
+        }
+    ],
+    "charRules": [ /* import_template_char_rule 列表 */ ]
+}
+```
+
+#### 15.3.4 核心流程
+
+```
+保存模板时自动创建版本:
+  1. 将当前模板配置(主表+所有子表)序列化为 snapshot_data JSON
+  2. 计算 version_no = 当前最大版本号 + 1
+  3. 自动生成 change_summary:
+     - 对比当前快照与上一版快照的 JSON Diff
+     - 提取关键变更: "新增Sheet'价格表', 修改spec字段映射, 新增2条品类映射"
+  4. 将旧版本的 is_current 置为 0, 新版本 is_current = 1
+  5. INSERT import_template_version
+
+回滚到指定版本:
+  1. 读取目标版本的 snapshot_data JSON
+  2. 反序列化为各实体对象
+  3. 在事务中:
+     a. 删除当前模板的所有子表数据(sheet/group/field/mapping/charRule)
+     b. 从快照重建所有子表数据(分配新的主键ID)
+     c. 更新主表字段
+     d. 创建一个新版本(version_tag="回滚至v{N}")
+     e. 更新 is_current 标记
+```
+
+#### 15.3.5 API 接口
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/v1/import-template/{id}/versions` | 获取模板的版本历史列表 |
+| GET | `/api/v1/import-template/{id}/version/{versionNo}` | 获取指定版本详情(含完整快照) |
+| GET | `/api/v1/import-template/{id}/version-diff?from={v1}&to={v2}` | 比较两个版本的差异 |
+| POST | `/api/v1/import-template/{id}/rollback/{versionNo}` | 回滚到指定版本 |
+
+#### 15.3.6 版本差异 (Diff) 输出
+
+```json
+{
+    "fromVersion": 2,
+    "toVersion": 3,
+    "changes": [
+        {
+            "path": "sheets[0].groups[0].fields[2]",
+            "type": "MODIFIED",
+            "fieldName": "产地",
+            "detail": "sourceType: COLUMN → FIXED_VALUE"
+        },
+        {
+            "path": "sheets[1]",
+            "type": "ADDED",
+            "detail": "新增Sheet '价格表' (contentType=PRICE)"
+        },
+        {
+            "path": "sheets[0].groups[0].fieldValueMappings[3]",
+            "type": "REMOVED",
+            "detail": "删除品类映射: 方管+黑材→方管"
+        }
+    ]
+}
+```
+
+#### 15.3.7 前端交互
+
+```
+模板编辑页右上角: [版本历史 🕐]
+
+点击后弹出侧滑面板:
+
+┌──────────────────────────────────────────┐
+│  版本历史                    [关闭]       │
+│                                          │
+│  v5 (当前) 2026-03-23 14:30   张三       │
+│  ├ 修改spec字段映射, 新增壁厚列           │
+│  │                         [查看] [对比]  │
+│  │                                       │
+│  v4  2026-03-20 10:15   李四             │
+│  ├ 新增Sheet'价格表'                     │
+│  │                  [查看] [对比] [回滚]  │
+│  │                                       │
+│  v3  2026-03-15 09:00   张三             │
+│  ├ 新增2条品类映射规则                    │
+│  │                  [查看] [对比] [回滚]  │
+│  │                                       │
+│  v2  2026-03-10 16:45   张三             │
+│  ├ 初始版本                              │
+│  │                  [查看] [对比] [回滚]  │
+│  │                                       │
+│  v1  2026-03-01 11:00   张三             │
+│  ├ 创建模板                              │
+│                            [查看]         │
+└──────────────────────────────────────────┘
+
+[对比] → 弹出左右对比视图, 高亮变更字段
+[回滚] → 二次确认后执行回滚, 自动创建 v6 (回滚至v4)
+```
+
+---
+
+### 15.4 异步导入
+
+#### 15.4.1 业务目标
+
+当 Excel 文件行数超过阈值（如 5000 行）时，同步解析会导致 HTTP 超时。需要：
+1. 大文件自动切换为异步模式
+2. 后台队列处理，进度实时推送至前端
+3. 处理完成后通知用户查看结果
+
+#### 15.4.2 数据库设计
+
+```sql
+-- ============================================================
+-- 异步导入任务表
+-- ============================================================
+CREATE TABLE `import_async_task` (
+    `id`                BIGINT          NOT NULL AUTO_INCREMENT  COMMENT '主键',
+    `task_no`           VARCHAR(64)     NOT NULL                 COMMENT '任务编号(UUID)',
+    `template_id`       BIGINT          NOT NULL                 COMMENT '模板ID',
+    `supplier_id`       BIGINT          DEFAULT NULL             COMMENT '供应商ID',
+    `file_name`         VARCHAR(256)    NOT NULL                 COMMENT '原始文件名',
+    `file_path`         VARCHAR(512)    NOT NULL                 COMMENT '服务端文件路径',
+    `file_size`         BIGINT          NOT NULL DEFAULT 0       COMMENT '文件大小(字节)',
+    `estimated_rows`    INT             DEFAULT NULL             COMMENT '预估总行数',
+    `task_status`       TINYINT         NOT NULL DEFAULT 0       COMMENT '任务状态 0-排队中 1-解析中 2-已完成 3-失败 4-已取消',
+    `progress_percent`  INT             NOT NULL DEFAULT 0       COMMENT '进度百分比 0-100',
+    `progress_detail`   VARCHAR(256)    DEFAULT NULL             COMMENT '进度描述(如: 正在解析Sheet"库存" 第1200/5000行)',
+    `current_sheet`     VARCHAR(128)    DEFAULT NULL             COMMENT '当前正在处理的Sheet名称',
+    `parsed_rows`       INT             NOT NULL DEFAULT 0       COMMENT '已解析行数',
+    `success_rows`      INT             NOT NULL DEFAULT 0       COMMENT '成功行数',
+    `error_rows`        INT             NOT NULL DEFAULT 0       COMMENT '错误行数',
+    `result_data`       LONGTEXT        DEFAULT NULL             COMMENT '解析结果(JSON, 同步模式的preview响应)',
+    `error_message`     VARCHAR(512)    DEFAULT NULL             COMMENT '失败原因(任务级错误)',
+    `started_at`        DATETIME        DEFAULT NULL             COMMENT '开始处理时间',
+    `completed_at`      DATETIME        DEFAULT NULL             COMMENT '完成时间',
+    `create_by`         VARCHAR(64)     DEFAULT NULL,
+    `create_time`       DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `update_time`       DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    `deleted`           TINYINT         NOT NULL DEFAULT 0,
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_task_no` (`task_no`),
+    KEY `idx_template_id` (`template_id`),
+    KEY `idx_task_status` (`task_status`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='异步导入任务表';
+```
+
+#### 15.4.3 后端架构
+
+```
+com.eiss.erp.defineimport.async
+├── AsyncImportService.java             // 异步导入服务
+├── ImportTaskExecutor.java             // 任务执行器(线程池)
+├── ImportProgressReporter.java         // 进度上报器(写DB + 推WebSocket)
+└── ImportTaskCleanupJob.java           // 定时清理过期任务
+```
+
+#### 15.4.4 核心流程
+
+```
+                         ┌─────────────┐
+                         │ 用户上传文件  │
+                         └──────┬──────┘
+                                │
+                                ▼
+                     ┌────────────────────┐
+                     │ 预估行数 > 阈值(5000)?│
+                     └─────┬─────┬────────┘
+                      否   │     │  是
+                           ▼     ▼
+              ┌──────────────┐  ┌──────────────────────┐
+              │ 同步模式      │  │ 异步模式              │
+              │ (现有流程)    │  │ 1. 保存文件至服务端    │
+              │ 直接返回结果  │  │ 2. 创建 async_task    │
+              └──────────────┘  │ 3. 返回 taskNo        │
+                                │ 4. 提交至线程池        │
+                                └──────────┬───────────┘
+                                           │
+                                           ▼
+                                ┌────────────────────┐
+                                │ ImportTaskExecutor  │
+                                │ (后台线程)           │
+                                │                    │
+                                │ 1. 加载模板配置     │
+                                │ 2. 逐Sheet解析      │
+                                │ 3. 每500行上报进度   │─── WebSocket ──→ 前端进度条
+                                │ 4. 完成后写结果      │
+                                │ 5. 更新 task_status  │
+                                └────────────────────┘
+
+进度上报 (ImportProgressReporter):
+  每处理 500 行调用一次:
+    1. UPDATE import_async_task SET
+         progress_percent = (parsedRows / estimatedRows) * 100,
+         progress_detail = '正在解析Sheet"库存" 第{n}/{total}行',
+         parsed_rows = n
+    2. 通过 WebSocket 推送进度消息给前端:
+       { taskNo, percent: 45, detail: "正在解析Sheet'库存' 第2250/5000行" }
+```
+
+#### 15.4.5 API 接口
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/api/v1/dynamic-import/preview` | 同步/异步自动切换（行数小于阈值走同步，否则返回 taskNo） |
+| GET | `/api/v1/async-task/{taskNo}/progress` | 轮询进度（WebSocket 不可用时的降级方案） |
+| GET | `/api/v1/async-task/{taskNo}/result` | 获取任务结果 |
+| POST | `/api/v1/async-task/{taskNo}/cancel` | 取消任务 |
+| WebSocket | `/ws/import-progress/{taskNo}` | 进度实时推送 |
+
+#### 15.4.6 异步响应示例
+
+```json
+// POST /api/v1/dynamic-import/preview 返回(异步模式)
+{
+    "code": 200,
+    "data": {
+        "async": true,
+        "taskNo": "task_20260323_abc123",
+        "estimatedRows": 12000,
+        "message": "文件行数较多, 已进入后台处理队列, 请通过进度页面查看结果",
+        "wsUrl": "/ws/import-progress/task_20260323_abc123"
+    }
+}
+```
+
+```json
+// WebSocket 推送消息
+{ "taskNo": "task_20260323_abc123", "percent": 45, "status": "PARSING",
+  "detail": "正在解析Sheet'库存' 第2250/5000行", "parsedRows": 2250, "errorRows": 3 }
+
+{ "taskNo": "task_20260323_abc123", "percent": 100, "status": "COMPLETED",
+  "detail": "解析完成", "successRows": 4980, "errorRows": 20 }
+```
+
+#### 15.4.7 前端交互
+
+```
+上传大文件后自动进入异步等待页面:
+
+┌──────────────────────────────────────────────┐
+│  📄 唐钢2026年3月库存.xlsx                     │
+│  模板: 唐钢库存+价格模板                       │
+│                                              │
+│  ████████████████░░░░░░░░  45%               │
+│                                              │
+│  正在解析 Sheet"库存" 第 2,250 / 5,000 行      │
+│  已成功: 2,230    错误: 3                     │
+│                                              │
+│  预计剩余时间: 约 15 秒                        │
+│                                              │
+│                              [取消]           │
+└──────────────────────────────────────────────┘
+
+完成后自动跳转至预览结果页(与同步模式相同的 PreviewTable)
+```
+
+#### 15.4.8 配置参数
+
+```yaml
+import:
+  async:
+    threshold: 5000           # 超过此行数自动切换异步
+    thread-pool-size: 4       # 并发处理任务数
+    progress-interval: 500    # 每N行上报一次进度
+    task-expire-hours: 24     # 任务结果保留时长
+    max-file-size-mb: 50      # 异步模式最大文件限制
+```
+
+---
+
+### 15.5 数据对账
+
+#### 15.5.1 业务目标
+
+每次导入完成后，自动与上一次同供应商/同品类的导入数据进行对比，发现：
+1. **价格异动**：哪些规格的价格涨了/跌了/持平
+2. **库存变动**：新增/下架/数量变化的规格
+3. **异常告警**：价格波动超过阈值时自动告警
+
+#### 15.5.2 数据库设计
+
+```sql
+-- ============================================================
+-- 对账记录表
+-- ============================================================
+CREATE TABLE `import_reconciliation` (
+    `id`                    BIGINT          NOT NULL AUTO_INCREMENT  COMMENT '主键',
+    `current_record_id`     BIGINT          NOT NULL                 COMMENT '本次导入记录ID',
+    `previous_record_id`    BIGINT          DEFAULT NULL             COMMENT '上次导入记录ID',
+    `supplier_id`           BIGINT          DEFAULT NULL             COMMENT '供应商ID',
+    `compare_time`          DATETIME        NOT NULL                 COMMENT '对比时间',
+    `total_items`           INT             NOT NULL DEFAULT 0       COMMENT '本次导入总条目数',
+    `unchanged_items`       INT             NOT NULL DEFAULT 0       COMMENT '无变化条目数',
+    `price_up_items`        INT             NOT NULL DEFAULT 0       COMMENT '价格上涨条目数',
+    `price_down_items`      INT             NOT NULL DEFAULT 0       COMMENT '价格下降条目数',
+    `new_items`             INT             NOT NULL DEFAULT 0       COMMENT '新增条目数',
+    `removed_items`         INT             NOT NULL DEFAULT 0       COMMENT '下架条目数(上次有本次无)',
+    `alert_items`           INT             NOT NULL DEFAULT 0       COMMENT '告警条目数(超阈值)',
+    `create_time`           DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (`id`),
+    KEY `idx_current_record` (`current_record_id`),
+    KEY `idx_supplier_id` (`supplier_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='对账记录表';
+
+-- ============================================================
+-- 对账明细表
+-- ============================================================
+CREATE TABLE `import_reconciliation_detail` (
+    `id`                    BIGINT          NOT NULL AUTO_INCREMENT  COMMENT '主键',
+    `reconciliation_id`     BIGINT          NOT NULL                 COMMENT '对账记录ID',
+    `category`              VARCHAR(128)    DEFAULT NULL             COMMENT '品类',
+    `spec`                  VARCHAR(128)    DEFAULT NULL             COMMENT '规格',
+    `origin`                VARCHAR(128)    DEFAULT NULL             COMMENT '产地',
+    `material`              VARCHAR(128)    DEFAULT NULL             COMMENT '材质',
+    `change_type`           VARCHAR(32)     NOT NULL                 COMMENT 'UNCHANGED/PRICE_UP/PRICE_DOWN/NEW/REMOVED/QUANTITY_CHANGE',
+    `prev_price`            DECIMAL(12,2)   DEFAULT NULL             COMMENT '上次价格',
+    `curr_price`            DECIMAL(12,2)   DEFAULT NULL             COMMENT '本次价格',
+    `price_diff`            DECIMAL(12,2)   DEFAULT NULL             COMMENT '价格差值(curr - prev)',
+    `price_diff_percent`    DECIMAL(8,4)    DEFAULT NULL             COMMENT '价格变化百分比',
+    `prev_weight`           DECIMAL(12,3)   DEFAULT NULL             COMMENT '上次重量/库存量',
+    `curr_weight`           DECIMAL(12,3)   DEFAULT NULL             COMMENT '本次重量/库存量',
+    `is_alert`              TINYINT         NOT NULL DEFAULT 0       COMMENT '是否告警 0-否 1-是',
+    `alert_reason`          VARCHAR(256)    DEFAULT NULL             COMMENT '告警原因',
+    `create_time`           DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (`id`),
+    KEY `idx_reconciliation_id` (`reconciliation_id`),
+    KEY `idx_change_type` (`change_type`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='对账明细表';
+
+-- ============================================================
+-- 对账告警规则表
+-- ============================================================
+CREATE TABLE `import_reconciliation_alert_rule` (
+    `id`                    BIGINT          NOT NULL AUTO_INCREMENT  COMMENT '主键',
+    `rule_name`             VARCHAR(128)    NOT NULL                 COMMENT '规则名称',
+    `supplier_id`           BIGINT          DEFAULT NULL             COMMENT '供应商ID(null=全局)',
+    `category_pattern`      VARCHAR(128)    DEFAULT NULL             COMMENT '品类匹配(null=全部, 支持通配符)',
+    `alert_type`            VARCHAR(32)     NOT NULL                 COMMENT 'PRICE_UP/PRICE_DOWN/PRICE_CHANGE/NEW/REMOVED',
+    `threshold_percent`     DECIMAL(8,4)    DEFAULT NULL             COMMENT '百分比阈值(如5.0000=5%)',
+    `threshold_amount`      DECIMAL(12,2)   DEFAULT NULL             COMMENT '金额阈值(如200.00=涨跌超200元)',
+    `notify_mode`           VARCHAR(64)     NOT NULL DEFAULT 'SYSTEM' COMMENT '通知方式: SYSTEM-系统消息/EMAIL/WEBHOOK',
+    `notify_target`         VARCHAR(512)    DEFAULT NULL             COMMENT '通知目标(邮箱/webhook地址)',
+    `enabled`               TINYINT         NOT NULL DEFAULT 1,
+    `create_time`           DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `update_time`           DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    `deleted`               TINYINT         NOT NULL DEFAULT 0,
+    PRIMARY KEY (`id`),
+    KEY `idx_supplier_id` (`supplier_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='对账告警规则表';
+```
+
+#### 15.5.3 后端架构
+
+```
+com.eiss.erp.defineimport.reconciliation
+├── ReconciliationService.java          // 对账服务(总入口)
+├── ReconciliationEngine.java           // 对账引擎(数据对比核心)
+├── AlertRuleEvaluator.java             // 告警规则评估器
+├── AlertNotifier.java                  // 告警通知发送器
+└── ReconciliationReportGenerator.java  // 对账报告生成器
+```
+
+#### 15.5.4 核心算法
+
+```
+输入: currentImportRecordId
+输出: ReconciliationResult
+
+算法:
+  1. 查找"上一次"的导入记录:
+     SELECT * FROM import_record
+     WHERE supplier_id = ? AND import_status = 1 AND id < currentId
+     ORDER BY create_time DESC LIMIT 1
+
+  2. 若无上次记录 → 所有条目标记为 NEW, 无对比基准
+
+  3. 构建匹配键:
+     a. 本次数据: Map<matchKey, currentRow>
+        matchKey = category + "|" + spec + "|" + origin + "|" + material
+     b. 上次数据: Map<matchKey, previousRow>
+
+  4. 遍历本次数据:
+     对每条 currentRow:
+       a. 在上次数据中查找相同 matchKey
+       b. 若未找到 → change_type = NEW
+       c. 若找到:
+          - price_diff = curr_price - prev_price
+          - 若 diff == 0 → UNCHANGED
+          - 若 diff > 0  → PRICE_UP
+          - 若 diff < 0  → PRICE_DOWN
+          - 同时计算 weight 变化 → QUANTITY_CHANGE
+
+  5. 遍历上次数据中未被本次匹配的条目:
+     → change_type = REMOVED
+
+  6. 对每条变更记录评估告警规则:
+     a. 从 alert_rule 表加载规则(按 supplier_id + category_pattern 匹配)
+     b. 检查 threshold_percent: |price_diff_percent| > threshold?
+     c. 检查 threshold_amount: |price_diff| > threshold?
+     d. 若触发 → is_alert = 1, 记录 alert_reason
+
+  7. 批量写入 reconciliation + reconciliation_detail
+  8. 触发告警通知
+```
+
+#### 15.5.5 API 接口
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/api/v1/reconciliation/run/{importRecordId}` | 对指定导入记录执行对账 |
+| GET | `/api/v1/reconciliation/{id}` | 获取对账结果详情 |
+| GET | `/api/v1/reconciliation/{id}/details` | 分页查询对账明细(支持按 change_type 筛选) |
+| GET | `/api/v1/reconciliation/{id}/report` | 导出对账报告(Excel) |
+| GET | `/api/v1/reconciliation/alerts` | 查询告警列表 |
+| POST | `/api/v1/reconciliation/alert-rule` | 创建告警规则 |
+
+#### 15.5.6 对账报告示例
+
+```
+┌────────────────────────────────────────────────────────────┐
+│  对账报告: 唐山钢铁 2026-03-23 vs 2026-03-20               │
+│                                                            │
+│  摘要:                                                     │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │ 总条目: 150  |  持平: 120  |  涨价: 15  |  降价: 8   │  │
+│  │ 新增: 5      |  下架: 2    |  ⚠ 告警: 3              │  │
+│  └──────────────────────────────────────────────────────┘  │
+│                                                            │
+│  ⚠ 告警条目:                                               │
+│  ┌────────┬────────┬────────┬────────┬────────┬────────┐  │
+│  │ 品类   │ 规格   │ 产地   │ 上次价  │ 本次价  │ 涨跌幅  │  │
+│  ├────────┼────────┼────────┼────────┼────────┼────────┤  │
+│  │ 槽钢   │ 10#    │ 唐山   │ 4200   │ 4550   │ +8.3%  │  │
+│  │ 角钢   │ 50*5   │ 邯郸   │ 4100   │ 3750   │ -8.5%  │  │
+│  │ 方管   │ 50*100 │ 天津   │ 5000   │ 5400   │ +8.0%  │  │
+│  └────────┴────────┴────────┴────────┴────────┴────────┘  │
+│                                                            │
+│  价格变动明细:                                              │
+│  ┌────────┬────────┬────────┬────────┬────────┬────────┐  │
+│  │ 品类   │ 规格   │ 产地   │ 上次价  │ 本次价  │ 变动    │  │
+│  ├────────┼────────┼────────┼────────┼────────┼────────┤  │
+│  │ 槽钢   │ 10#    │ 唐山   │ 4200   │ 4550   │ +350   │  │
+│  │ 槽钢   │ 12#    │ 唐山   │ 4300   │ 4350   │ +50    │  │
+│  │ 角钢   │ 50*5   │ 邯郸   │ 4100   │ 3750   │ -350   │  │
+│  │ ...                                                     │
+│  └────────┴────────┴────────┴────────┴────────┴────────┘  │
+└────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 15.6 规则复制
+
+#### 15.6.1 业务目标
+
+当新供应商的 Excel 格式与已有模板相似时，运营人员需要：
+1. 从已有模板快速复制全部或部分配置到新模板
+2. 复制后可独立修改，不影响原模板
+3. 支持细粒度选择（只复制某个 Sheet 的配置、某个组的映射规则等）
+
+#### 15.6.2 复制粒度
+
+| 复制级别 | 说明 | 复制内容 |
+|---------|------|---------|
+| **整模板复制** | 完整克隆一个模板 | 主表(新编号) + 所有 Sheet + Group + Field + Mapping + CharRule + PriceMatchRule |
+| **Sheet 级复制** | 复制某个 Sheet 的配置到当前模板 | Sheet配置 + 其下所有 Group + Field + Mapping + PriceMatchRule |
+| **组级复制** | 复制某个数据组到当前 Sheet | Group配置 + 其下所有 Field + Mapping |
+| **字段级复制** | 复制某个字段映射到当前组 | Field 配置(含 source_config + transform_config) |
+
+#### 15.6.3 API 接口
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/api/v1/import-template/{id}/clone` | 整模板克隆(指定新编号+新供应商) |
+| POST | `/api/v1/import-template/{id}/copy-sheet` | 从源模板复制 Sheet 到当前模板 |
+| POST | `/api/v1/import-template/{id}/copy-group` | 从源模板复制数据组到当前 Sheet |
+| POST | `/api/v1/import-template/{id}/copy-field` | 从源模板复制字段映射到当前组 |
+
+#### 15.6.4 整模板克隆接口详解
+
+```
+POST /api/v1/import-template/{sourceId}/clone
+  Request: {
+    "newTemplateCode": "TPL_HANDAN_001",
+    "newTemplateName": "邯钢库存模板(从唐钢复制)",
+    "newSupplierId": 1002,
+    "newSupplierName": "邯郸钢铁",
+    "includeCharRules": true,
+    "includePriceMatchRules": true
+  }
+  Response: {
+    "code": 200,
+    "data": {
+      "newTemplateId": 205,
+      "newTemplateCode": "TPL_HANDAN_001",
+      "copiedSheets": 2,
+      "copiedGroups": 5,
+      "copiedFields": 28,
+      "copiedMappings": 12,
+      "copiedCharRules": 3
+    }
+  }
+```
+
+#### 15.6.5 核心流程
+
+```
+整模板克隆:
+  1. 读取源模板的完整配置(同版本快照的序列化方式)
+  2. 在事务中:
+     a. INSERT import_template (新编号, 新供应商, 其余字段从源复制)
+     b. 遍历源模板的 sheets:
+        - INSERT import_template_sheet (template_id=新模板ID)
+        - 遍历 groups:
+          · INSERT import_template_group (sheet_config_id=新SheetID)
+          · 遍历 fields:
+            INSERT import_template_field (group_id=新GroupID)
+          · 遍历 fieldValueMappings:
+            INSERT import_template_field_value_mapping (group_id=新GroupID)
+        - 复制 priceMatchRule:
+          INSERT import_template_price_match_rule (sheet_config_id=新SheetID)
+     c. 复制 charRules:
+        INSERT import_template_char_rule (template_id=新模板ID)
+  3. 自动为新模板创建版本 v1
+
+Sheet级复制:
+  1. 读取源 Sheet 的完整配置
+  2. 对目标模板:
+     a. 检查 sheet_index 是否冲突 → 若冲突, 自动分配下一个可用索引
+     b. INSERT sheet + groups + fields + mappings (关联到目标模板)
+
+注意事项:
+  - 所有主键ID重新分配, 外键关系同步更新
+  - 新模板与源模板完全独立, 后续修改互不影响
+  - 克隆时自动在 remark 中标注来源: "从模板 TPL_TANGSHAN_001 克隆"
+```
+
+#### 15.6.6 前端交互
+
+```
+一、整模板克隆(在模板列表页)
+
+模板列表中每行操作栏:  [编辑] [删除] [克隆]
+
+点击 [克隆] → 弹出对话框:
+┌──────────────────────────────────────┐
+│  克隆模板                             │
+│                                      │
+│  源模板:  唐钢库存+价格模板            │
+│                                      │
+│  新模板编号: [TPL_HANDAN_001    ]     │
+│  新模板名称: [邯钢库存模板       ]     │
+│  关联供应商: [邯郸钢铁 ▼         ]     │
+│                                      │
+│  复制选项:                            │
+│  ☑ 字符转换规则                       │
+│  ☑ 价格匹配规则                       │
+│                                      │
+│          [取消]           [确认克隆]   │
+└──────────────────────────────────────┘
+
+二、Sheet/组/字段级复制(在模板设计器中)
+
+右键菜单或工具栏:
+  [从其他模板导入配置 ▼]
+    ├─ 导入整个Sheet配置...
+    ├─ 导入数据组配置...
+    └─ 导入字段映射...
+
+选择后弹出选择器:
+┌──────────────────────────────────────────┐
+│  从其他模板导入 Sheet 配置                  │
+│                                          │
+│  选择源模板: [唐钢库存+价格模板 ▼]          │
+│  选择源Sheet: [○ 库存(Sheet0)             │
+│               ● 价格表(Sheet1)  ]         │
+│                                          │
+│  预览:                                    │
+│  ├ 2 个数据组                              │
+│  ├ 12 个字段映射                           │
+│  ├ 4 条字段值映射                          │
+│  └ 1 条价格匹配规则                        │
+│                                          │
+│            [取消]            [导入]        │
+└──────────────────────────────────────────┘
+```
+
+---
+
+### 15.7 扩展功能数据库 ER 图（汇总）
+
+```
+import_template (1) ──┬──< import_template_sheet (N)
+                      │         │
+                      │         ├──< import_template_group (M)
+                      │         │         │
+                      │         │         ├──< import_template_field (K)
+                      │         │         │
+                      │         │         └──< import_template_field_value_mapping (L)
+                      │         │
+                      │         └──< import_template_price_match_rule (0..1)
+                      │
+                      ├──< import_template_char_rule (P)
+                      │
+                      ├──< import_template_version (Q)            ← v1.4 版本管理
+                      │
+                      ├──< import_template_fingerprint (0..1)     ← v1.4 模板推荐
+                      │
+                      └── 关联 supplier(供应商)
+
+import_record (1) ──< import_reconciliation (0..1)                ← v1.4 数据对账
+                              │
+                              └──< import_reconciliation_detail (N)
+
+import_async_task (独立)                                           ← v1.4 异步导入
+
+import_char_rule_preset (独立)                                     ← v1.1 字符转换
+import_header_lexicon (独立)                                       ← v1.4 智能识别
+import_reconciliation_alert_rule (独立)                             ← v1.4 对账告警
+```
+
+### 15.8 扩展功能新增表汇总
+
+| 序号 | 表名 | 功能模块 | 说明 |
+|------|------|---------|------|
+| 10 | `import_header_lexicon` | 智能表头识别 | 表头关键词词库(可在线维护) |
+| 11 | `import_template_fingerprint` | 模板自动推荐 | 模板结构指纹(表头关键词+列数+Sheet数) |
+| 12 | `import_template_version` | 模板版本管理 | 版本快照(含完整JSON+变更摘要) |
+| 13 | `import_async_task` | 异步导入 | 异步任务跟踪(进度+状态+结果) |
+| 14 | `import_reconciliation` | 数据对账 | 对账记录(汇总统计) |
+| 15 | `import_reconciliation_detail` | 数据对账 | 对账明细(逐条变更记录) |
+| 16 | `import_reconciliation_alert_rule` | 数据对账 | 告警规则(阈值+通知方式) |
