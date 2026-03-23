@@ -25,5 +25,9 @@ public class CompositeSourceConfig {
         private Integer col;
         /** 当 sourceType 为 COMPOSITE 时，嵌套组合的 JSON（结构与 {@link CompositeSourceConfig} 一致） */
         private String sourceConfig;
+
+        public String getSourceConfig() {
+            return sourceConfig;
+        }
     }
 }

@@ -3,7 +3,7 @@ package com.eiss.erp.defineimport.engine;
 import com.alibaba.excel.context.AnalysisContext;
 import com.alibaba.excel.event.AnalysisEventListener;
 import com.eiss.erp.defineimport.model.config.CharTransformConfig;
-import com.eiss.erp.defineimport.model.config.ColumnSourceConfig;
+import com.eiss.erp.defineimport.model.config.ColumnHeaderSourceConfig;
 import com.eiss.erp.defineimport.model.config.TransformConfig;
 import com.eiss.erp.defineimport.model.dto.*;
 import com.eiss.erp.defineimport.model.enums.ContentTypeEnum;
@@ -13,7 +13,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.*;
-import java.util.stream.Collectors;
 
 /**
  * 动态Excel监听器
@@ -79,7 +78,7 @@ public class DynamicExcelListener extends AnalysisEventListener<Map<Integer, Str
         if (isEmptyRow(rowData)) {
             consecutiveEmptyRows++;
             int threshold = sheetConfig.getEmptyRowThreshold() != null
-                    ? sheetConfig.getEmptyRowThreshold() : 3;
+                    ? sheetConfig.getEmptyRowThreshold() : 2;
             if (consecutiveEmptyRows >= threshold) {
                 stopped = true;
             }
@@ -121,6 +120,8 @@ public class DynamicExcelListener extends AnalysisEventListener<Map<Integer, Str
     private void processGroupRow(Map<Integer, String> rowData, int currentRow, GroupConfigDto group) {
         String sheetName = sheetConfig.getSheetName() != null
                 ? sheetConfig.getSheetName() : "Sheet" + sheetConfig.getSheetIndex();
+
+        String mappingQualifier = resolveQualifier(group);
 
         ParsedRowDto row = new ParsedRowDto();
         row.setRowIndex(currentRow + 1);
@@ -165,7 +166,7 @@ public class DynamicExcelListener extends AnalysisEventListener<Map<Integer, Str
                 transformedValue = FieldValueMapper.map(
                         field.getFieldCode(),
                         transformedValue,
-                        null,
+                        mappingQualifier,
                         group.getFieldValueMappings());
             }
 
@@ -188,10 +189,41 @@ public class DynamicExcelListener extends AnalysisEventListener<Map<Integer, Str
             ExcelImportError dupError = duplicateDetector.check(row);
             if (dupError != null) {
                 errors.add(dupError);
+                return;
             }
         }
 
         parsedRows.add(row);
+    }
+
+    /**
+     * Resolves qualifier for field value mappings: header text from COLUMN_HEADER fields,
+     * otherwise the group name (e.g. semantic labels like 黑材 / 白材).
+     */
+    private String resolveQualifier(GroupConfigDto group) {
+        if (group.getFields() != null) {
+            for (FieldMappingDto field : group.getFields()) {
+                if (!"COLUMN_HEADER".equals(field.getSourceType())) {
+                    continue;
+                }
+                if (field.getSourceConfig() == null || field.getSourceConfig().isBlank()) {
+                    continue;
+                }
+                try {
+                    ColumnHeaderSourceConfig config = OBJECT_MAPPER.readValue(
+                            field.getSourceConfig(), ColumnHeaderSourceConfig.class);
+                    if (config != null && config.getColumnIndex() != null) {
+                        String headerText = headRowData.get(config.getColumnIndex());
+                        if (headerText != null && !headerText.isBlank()) {
+                            return headerText.trim();
+                        }
+                    }
+                } catch (Exception ignored) {
+                }
+            }
+        }
+        String name = group.getGroupName();
+        return name != null && !name.isBlank() ? name.trim() : null;
     }
 
     private void applyFixedGroupValues(ParsedRowDto row, GroupConfigDto group) {
