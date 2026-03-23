@@ -54,7 +54,6 @@ public class PriceWritebackExecutor {
      * @param specRangeMatchMode       0=no, 1=split+range
      * @param specRangeConfig          config for spec range
      * @param writebackMode            UPDATE_EMPTY_ONLY / UPDATE_ALL / UPDATE_IF_CHANGED
-     * @param priceRecordId            optional price import record id stored on updated rows
      */
     @Transactional(rollbackFor = Exception.class)
     public WritebackResult execute(List<ParsedRowDto> priceRows,
@@ -65,8 +64,7 @@ public class PriceWritebackExecutor {
                                    int wallThicknessMatchMode,
                                    int specRangeMatchMode,
                                    SpecRangeConfig specRangeConfig,
-                                   String writebackMode,
-                                   Long priceRecordId) {
+                                   String writebackMode) {
         List<ExcelImportError> unmatchedDetails = new ArrayList<>();
         if (priceRows == null) {
             priceRows = List.of();
@@ -145,7 +143,7 @@ public class PriceWritebackExecutor {
             upd.setId(invIds.get(i));
             upd.setPrice(newP);
             upd.setPriceSource(PRICE_SOURCE_CROSS_BATCH);
-            upd.setPriceRecordId(priceRecordId);
+            upd.setPriceRecordId(null);
             upd.setPriceUpdatedAt(LocalDateTime.now());
             pending.add(upd);
             updatedRows++;
@@ -162,24 +160,6 @@ public class PriceWritebackExecutor {
 
         return new WritebackResult(totalPriceRows, matchedPriceRows, matchErrors.size(),
                 updatedRows, skippedRows, unmatchedDetails);
-    }
-
-    /**
-     * Same as {@link #execute(List, Long, String, Long, List, int, int, SpecRangeConfig, String, Long)}
-     * with no price record id.
-     */
-    @Transactional(rollbackFor = Exception.class)
-    public WritebackResult execute(List<ParsedRowDto> priceRows,
-                                   Long inventoryRecordId,
-                                   String batchNo,
-                                   Long supplierId,
-                                   List<String> matchFields,
-                                   int wallThicknessMatchMode,
-                                   int specRangeMatchMode,
-                                   SpecRangeConfig specRangeConfig,
-                                   String writebackMode) {
-        return execute(priceRows, inventoryRecordId, batchNo, supplierId, matchFields,
-                wallThicknessMatchMode, specRangeMatchMode, specRangeConfig, writebackMode, null);
     }
 
     private void flushUpdates(List<ImportInventoryData> batch) {
