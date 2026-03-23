@@ -1,8 +1,8 @@
 import { createRouter, createWebHistory } from 'vue-router'
-import TemplateListPage from '../views/TemplateListPage.vue'
-import TemplateDesignerPage from '../views/TemplateDesignerPage.vue'
-import DynamicImportPage from '../views/DynamicImportPage.vue'
-import ExcelPreviewPage from '../views/ExcelPreviewPage.vue'
+import TemplateListPage from '@/views/template/TemplateListPage.vue'
+import TemplateDesignerPage from '@/views/template/TemplateDesignerPage.vue'
+import DynamicImportPage from '@/views/import/DynamicImportPage.vue'
+import ExcelPreviewPage from '@/views/ExcelPreviewPage.vue'
 
 const router = createRouter({
   history: createWebHistory(),
