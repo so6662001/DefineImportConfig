@@ -308,6 +308,13 @@ public class FieldValueResolver {
                 }
                 return null;
             }
+            case "COMPOSITE": {
+                if (part.getSourceConfig() == null || part.getSourceConfig().isBlank()) {
+                    return null;
+                }
+                return resolveComposite(part.getSourceConfig(), rowData, headerColumnMap,
+                        fieldCode, mergeCellCollector, currentRowIndex, headRowData);
+            }
             default:
                 return null;
         }
