@@ -1,12 +1,13 @@
 # 钢贸动态 Excel 导入系统 — 详细设计文档
 
-> 版本：v1.5  
+> 版本：v1.6  
 > 技术栈：Java 17 + Spring Boot + Alibaba EasyExcel + MyBatis-Plus + MySQL + Vue 3 + Redis + RocketMQ/RabbitMQ + MinIO  
 > v1.1 变更：新增「规格特殊符号转换」子系统设计  
 > v1.2 变更：① 品类映射泛化为通用字段值映射 ② 行间继承 ③ 数值提取 ④ 多品类价格分组 ⑤ 场景 6-10  
 > v1.3 变更：新增「规格附带区间后缀解析与匹配」  
-> v1.4 变更：完成 6 项扩展方向的完整设计——智能表头识别、模板自动推荐、模板版本管理、异步导入、数据对账、规则复制  
-> v1.5 变更：万人并发导入架构设计——全链路异步化、分布式文件存储、MQ 削峰填谷、Redis 缓存与进度、Worker 弹性伸缩、数据库读写分离与分表  
+> v1.4 变更：完成 6 项扩展方向的完整设计  
+> v1.5 变更：万人并发导入架构设计  
+> v1.6 变更：新增「库存与价格分批导入 + 跨批次价格回写」——支持先导库存后导价格，价格自动回写已入库库存  
 
 ---
 
@@ -33,6 +34,7 @@
 | 产地/材质灵活 | 产地和材质也存在类似品类的映射规则，如表头限定词派生、固定单元格指定等 |
 | 一行多品类价格 | 同一行存在多个品类的价格列（如"焊管"列 + "华岐(镀锌管)"列 + "中天(镀锌管)"列），每列是独立品类+产地的价格 |
 | 规格附带区间后缀 | 镀锌型材等品类的规格后附带重量/数量区间，如库存 `5#（10-15）`、价格 `5#(10以上)`，匹配时需拆分基础规格与区间后缀做包含判断 |
+| 库存与价格分批导入 | 库存表和价格表分别在不同的 Excel 中，先导入库存落库，再导入价格表后需将价格回写到已入库的库存记录 |
 | 库存冷热水分组 | 钢塑管等品类中"冷水"和"热水"是两个品类，同一 Sheet 需按区域分组读取 |
 
 ### 1.2 核心目标
@@ -124,6 +126,38 @@ category  null                + "华岐"(表头)          → "镀锌管"
 origin    null                + "华岐"(表头)          → "华岐"
 origin    "津西"              + null                  → "天津津西"
 material  null                + "Q235B"(表头)         → "Q235B"
+```
+
+#### 库存与价格分批导入 (CrossBatchPriceWriteback) — v1.6 新增
+
+当库存表和价格表分别位于不同的 Excel 文件时，需要分两次导入。价格导入完成后，系统需自动将价格回写到已入库的库存记录中。
+
+```
+导入模式对比:
+
+模式 A: 同文件导入 (v1.0 已支持)
+  ┌─────────────────────────────────────────┐
+  │  一个 Excel 文件                         │
+  │  ├─ Sheet1: 库存                        │
+  │  └─ Sheet2: 价格                        │
+  │  解析顺序: 先库存后价格, 同次匹配         │
+  └─────────────────────────────────────────┘
+
+模式 B: 分批导入 ★ v1.6 新增
+  ┌────────────────┐     ┌────────────────┐
+  │ 第1次: 库存.xlsx │     │ 第2次: 价格.xlsx │
+  │ import_type=1   │     │ import_type=2   │
+  │ batch_no=B001   │     │ batch_no=B001   │
+  │ → 确认入库      │     │ → 解析价格      │
+  │ → 写入          │     │ → 匹配库存      │
+  │   inventory_data│     │ → 回写价格      │
+  └────────────────┘     └────────────────┘
+       ↑                        │
+       │   价格回写(UPDATE price) │
+       └────────────────────────┘
+
+模式 C: 仅导入价格, 回写到"最近一次"库存 ★ v1.6 新增
+  无需指定 batch_no, 自动查找同供应商最近一次已确认的库存记录
 ```
 
 #### 规格行间继承 (RowInherit) — v1.2 新增
@@ -316,10 +350,15 @@ CREATE TABLE `import_record` (
     `supplier_id`       BIGINT          DEFAULT NULL             COMMENT '供应商ID',
     `file_name`         VARCHAR(256)    NOT NULL                 COMMENT '上传文件名',
     `file_path`         VARCHAR(512)    NOT NULL                 COMMENT '文件存储路径',
+    `import_type`       TINYINT         NOT NULL DEFAULT 0       COMMENT 'v1.6 导入类型 0-混合(同文件库存+价格) 1-仅库存 2-仅价格',
+    `batch_no`          VARCHAR(64)     DEFAULT NULL             COMMENT 'v1.6 批次号(库存与价格关联用, 同一批次的库存和价格共享此编号)',
+    `linked_record_id`  BIGINT          DEFAULT NULL             COMMENT 'v1.6 关联的导入记录ID(价格记录关联到库存记录)',
     `total_rows`        INT             NOT NULL DEFAULT 0       COMMENT '总行数',
     `success_rows`      INT             NOT NULL DEFAULT 0       COMMENT '成功行数',
     `error_rows`        INT             NOT NULL DEFAULT 0       COMMENT '错误行数',
     `import_status`     TINYINT         NOT NULL DEFAULT 0       COMMENT '导入状态 0-预览中 1-已确认 2-已回滚',
+    `price_writeback_status` TINYINT    DEFAULT NULL             COMMENT 'v1.6 价格回写状态 null-不涉及 0-待回写 1-回写中 2-回写完成 3-回写失败',
+    `price_writeback_summary` JSON      DEFAULT NULL             COMMENT 'v1.6 回写结果摘要(匹配数/未匹配数/更新数)',
     `error_detail`      LONGTEXT        DEFAULT NULL             COMMENT '错误详情JSON',
     `create_by`         VARCHAR(64)     DEFAULT NULL,
     `create_time`       DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -327,8 +366,45 @@ CREATE TABLE `import_record` (
     `deleted`           TINYINT         NOT NULL DEFAULT 0,
     PRIMARY KEY (`id`),
     KEY `idx_template_id` (`template_id`),
-    KEY `idx_supplier_id` (`supplier_id`)
+    KEY `idx_supplier_id` (`supplier_id`),
+    KEY `idx_batch_no` (`batch_no`),
+    KEY `idx_linked_record` (`linked_record_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='导入记录表';
+
+
+-- ============================================================
+-- 7.1 已导入库存数据表(v1.6 新增, 库存确认入库后的持久化数据)
+-- ============================================================
+CREATE TABLE `import_inventory_data` (
+    `id`                BIGINT          NOT NULL AUTO_INCREMENT  COMMENT '主键',
+    `record_id`         BIGINT          NOT NULL                 COMMENT '所属导入记录ID',
+    `batch_no`          VARCHAR(64)     NOT NULL                 COMMENT '批次号',
+    `supplier_id`       BIGINT          DEFAULT NULL             COMMENT '供应商ID',
+    `category`          VARCHAR(128)    DEFAULT NULL             COMMENT '品类',
+    `spec`              VARCHAR(128)    DEFAULT NULL             COMMENT '规格',
+    `origin`            VARCHAR(128)    DEFAULT NULL             COMMENT '产地',
+    `material`          VARCHAR(128)    DEFAULT NULL             COMMENT '材质',
+    `package_num`       INT             DEFAULT NULL             COMMENT '包装数量',
+    `whole_num`         INT             DEFAULT NULL             COMMENT '整件数',
+    `odd_num`           INT             DEFAULT NULL             COMMENT '零数',
+    `weight`            DECIMAL(12,3)   DEFAULT NULL             COMMENT '重量',
+    `price`             DECIMAL(12,2)   DEFAULT NULL             COMMENT '单价(初始可为空, 价格回写时更新)',
+    `price_source`      TINYINT         DEFAULT NULL             COMMENT 'v1.6 价格来源 null-未赋价 0-同文件价格 1-跨批次回写',
+    `price_record_id`   BIGINT          DEFAULT NULL             COMMENT 'v1.6 价格来源的导入记录ID',
+    `price_updated_at`  DATETIME        DEFAULT NULL             COMMENT 'v1.6 价格更新时间',
+    `remark`            VARCHAR(512)    DEFAULT NULL             COMMENT '备注',
+    `source_sheet`      VARCHAR(128)    DEFAULT NULL             COMMENT '来源Sheet名',
+    `source_row`        INT             DEFAULT NULL             COMMENT '来源行号',
+    `create_time`       DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `update_time`       DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    `deleted`           TINYINT         NOT NULL DEFAULT 0,
+    PRIMARY KEY (`id`),
+    KEY `idx_record_id` (`record_id`),
+    KEY `idx_batch_no` (`batch_no`),
+    KEY `idx_supplier_id` (`supplier_id`),
+    KEY `idx_category_spec` (`category`, `spec`),
+    KEY `idx_price_source` (`price_source`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='已导入库存数据表';
 ```
 
 -- ============================================================
@@ -925,6 +1001,7 @@ com.eiss.erp.defineimport
 │   ├── FieldValueMapper.java                   // ★ v1.2 通用字段值映射(品类/产地/材质, 原 CategoryMapper)
 │   ├── SpecRangeParser.java                    // ★ v1.3 规格区间后缀解析器(拆分基础规格+区间)
 │   ├── PriceMatcher.java                       // 价格→库存匹配器(v1.3 增强: 支持规格区间匹配)
+│   ├── PriceWritebackExecutor.java             // ★ v1.6 跨批次价格回写执行器
 │   └── DataValidator.java                      // 数据校验器
 │
 ├── model/
@@ -937,7 +1014,8 @@ com.eiss.erp.defineimport
 │   │   ├── ImportTemplatePriceMatchRule.java
 │   │   ├── ImportCharRulePreset.java            // 系统预置字符转换规则
 │   │   ├── ImportTemplateCharRule.java          // 模板字符转换规则
-│   │   └── ImportRecord.java
+│   │   ├── ImportRecord.java
+│   │   └── ImportInventoryData.java             // v1.6 已导入库存数据
 │   │
 │   ├── dto/                                     // 数据传输对象
 │   │   ├── template/
@@ -989,7 +1067,8 @@ com.eiss.erp.defineimport
 │   ├── ImportTemplatePriceMatchRuleMapper.java
 │   ├── ImportCharRulePresetMapper.java          // 系统预置字符规则 Mapper
 │   ├── ImportTemplateCharRuleMapper.java        // 模板字符规则 Mapper
-│   └── ImportRecordMapper.java
+│   ├── ImportRecordMapper.java
+│   └── ImportInventoryDataMapper.java           // v1.6 已导入库存数据 Mapper
 │
 └── util/
     ├── CellRefUtil.java                        // "B3" ↔ (row=2, col=1) 互转
@@ -1004,18 +1083,35 @@ com.eiss.erp.defineimport
 
 ```
 职责: 协调整个 Excel 的解析流程
-输入: InputStream(Excel文件) + ImportTemplateDto(模板规则)
+输入: InputStream(Excel文件) + ImportTemplateDto(模板规则) + ImportContext(导入上下文)
 输出: List<PreviewEasyDto>(统一预览数据) + List<ExcelImportError>(错误列表)
 
 流程:
-  1. 加载模板的完整配置(含Sheet/Group/Field/CategoryMapping)
+  1. 加载模板的完整配置(含Sheet/Group/Field/FieldValueMapping)
   2. 遍历各 Sheet 配置 → 按 sort_order 排序(库存优先)
   3. 对每个 Sheet:
      a. 第一遍读取: 收集 CellExtra(合并单元格信息)
      b. 第二遍读取: 流式逐行解析
-  4. 库存数据全部解析完成后，再解析价格数据
-  5. 执行价格→库存匹配
-  6. 返回结果
+
+  ---- 以下根据 importType 分流 ----
+
+  模式 A: 同文件导入(importType=0, 同一Excel含库存+价格)
+    4A. 库存数据全部解析完成后，再解析价格数据
+    5A. 执行 PriceMatcher(内存中匹配)
+    6A. 返回结果(库存已带价格)
+
+  模式 B: 仅导入库存(importType=1)
+    4B. 仅解析库存 Sheet(跳过价格 Sheet)
+    5B. 确认后批量写入 import_inventory_data(price=null)
+    6B. 返回结果 + 提示"待赋价"
+
+  模式 C: 仅导入价格(importType=2)  ★ v1.6
+    4C. 仅解析价格 Sheet
+    5C. 调用 PriceWritebackExecutor:
+        a. 从 DB 加载已入库的库存数据(按 batchNo 或 supplierId)
+        b. 执行匹配(复用 PriceMatcher 算法)
+        c. 批量 UPDATE import_inventory_data.price
+    6C. 返回结果 + 回写报告
 ```
 
 #### DynamicExcelListener（EasyExcel 行级监听器）
@@ -1188,6 +1284,90 @@ com.eiss.erp.defineimport
 
   3. 匹配成功 → 将价格写入库存记录的 price 字段
   4. 未匹配的价格 → 生成 ExcelImportError
+```
+
+#### PriceWritebackExecutor（跨批次价格回写执行器）★ v1.6 新增
+
+```
+职责: 价格表独立导入后, 将价格回写到已入库的库存记录(import_inventory_data)
+
+输入:
+  priceRecordId     — 价格导入记录ID
+  inventoryRecordId — 库存导入记录ID (可选, 不传则自动查找)
+  priceMatchRule    — 匹配规则 (可选, 不传则使用模板配置)
+  writebackMode     — 回写模式
+
+核心流程:
+
+  1. 定位库存数据:
+     a. 若指定 inventoryRecordId → 直接使用
+     b. 若指定 batchNo → 按 batch_no 查找同批次的库存记录
+     c. 若都未指定 → 查找同供应商最近一次已确认的库存记录:
+        SELECT * FROM import_record
+        WHERE supplier_id = ? AND import_type = 1 AND import_status = 1
+        ORDER BY create_time DESC LIMIT 1
+
+  2. 加载库存数据:
+     SELECT * FROM import_inventory_data
+     WHERE record_id = {inventoryRecordId} AND deleted = 0
+
+  3. 加载本次解析的价格数据:
+     从价格导入的解析结果(ParsedRowDto列表)中获取
+
+  4. 构建库存索引(加速匹配):
+     Map<String matchKey, List<ImportInventoryData>> inventoryIndex
+     matchKey = category + "|" + spec + "|" + origin + "|" + material
+     (按 priceMatchRule.matchFields 决定参与拼接的字段)
+
+  5. 逐条匹配价格:
+     对每条价格记录:
+       a. 生成 matchKey
+       b. 在 inventoryIndex 中查找
+       c. 若命中多条库存(同key) → 每条都更新
+       d. 额外执行壁厚区间/规格区间后缀匹配(若配置了)
+       e. 匹配结果:
+          · MATCHED   → 记录待更新
+          · UNMATCHED → 记录到 unmatchedList
+
+  6. 按 writebackMode 执行更新:
+     UPDATE_EMPTY_ONLY:
+       UPDATE import_inventory_data
+       SET price = ?, price_source = 1, price_record_id = ?,
+           price_updated_at = NOW()
+       WHERE id = ? AND (price IS NULL OR price = 0)
+
+     UPDATE_ALL:
+       UPDATE import_inventory_data
+       SET price = ?, price_source = 1, price_record_id = ?,
+           price_updated_at = NOW()
+       WHERE id = ?
+
+     UPDATE_IF_CHANGED:
+       UPDATE import_inventory_data
+       SET price = ?, price_source = 1, price_record_id = ?,
+           price_updated_at = NOW()
+       WHERE id = ? AND (price IS NULL OR price != ?)
+
+  7. 批量 UPDATE (每 500 条一批, 减少事务锁定时间)
+
+  8. 更新 import_record 的回写状态:
+     UPDATE import_record
+     SET price_writeback_status = 2,
+         price_writeback_summary = '{...}'
+     WHERE id = {priceRecordId}
+
+  9. 返回 WritebackResult:
+     { matchedRows, unmatchedRows, updatedRows, skippedRows, unmatchedDetails }
+
+自动查找库存的优先级:
+  1. 同 batch_no 的库存记录 (最精确)
+  2. linked_record_id 指定的库存记录
+  3. 同 supplier_id 最近一次已确认的库存记录 (兜底)
+  4. 都找不到 → 回写失败, 提示"请先导入库存"
+
+并发安全:
+  使用 Redis 分布式锁 lock:writeback:{inventoryRecordId}
+  防止同一份库存被多个价格导入并发回写导致数据不一致
 ```
 
 #### SpecRangeParser（规格区间后缀解析器）★ v1.3 新增
@@ -1739,6 +1919,108 @@ com.eiss.erp.defineimport
 | POST | `/api/v1/dynamic-import/preview` | 上传 Excel + 选择模板 → 返回预览数据 |
 | POST | `/api/v1/dynamic-import/confirm` | 确认导入预览数据 |
 
+### 6.4 分批导入与价格回写接口 — v1.6 新增
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/api/v1/dynamic-import/inventory` | 仅导入库存（importType=1），指定或自动生成 batchNo |
+| POST | `/api/v1/dynamic-import/price` | 仅导入价格（importType=2），指定 batchNo 或 linkedRecordId |
+| POST | `/api/v1/price-writeback/execute` | 手动触发价格回写（选择价格记录 → 匹配库存 → 回写） |
+| GET | `/api/v1/price-writeback/{recordId}/result` | 查询价格回写结果 |
+| GET | `/api/v1/inventory-data/list` | 查询已入库的库存数据（支持按供应商/批次/品类筛选） |
+| GET | `/api/v1/inventory-data/unpriced` | 查询尚未赋价的库存数据 |
+
+#### POST `/api/v1/dynamic-import/inventory` — 仅导入库存
+
+**Request**: `multipart/form-data`
+- `file`: Excel 文件
+- `templateId`: 模板 ID
+- `batchNo`: 批次号（可选，不传则自动生成）
+
+**Response**:
+```json
+{
+    "code": 200,
+    "data": {
+        "taskId": "import_20260323_inv_001",
+        "importType": "INVENTORY",
+        "batchNo": "B20260323001",
+        "inventoryRows": [ ... ],
+        "errors": [ ... ],
+        "summary": {
+            "totalRows": 150,
+            "successRows": 148,
+            "errorRows": 2,
+            "unpricedRows": 148,
+            "message": "库存导入完成, 148条待赋价。请导入价格表完成赋价, 或稍后在价格回写页面操作。"
+        }
+    }
+}
+```
+
+#### POST `/api/v1/dynamic-import/price` — 仅导入价格
+
+**Request**: `multipart/form-data`
+- `file`: Excel 文件
+- `templateId`: 模板 ID
+- `batchNo`: 关联的库存批次号（与库存关联）
+- `linkedRecordId`: 或直接指定库存导入记录 ID（二选一）
+- `autoWriteback`: 是否导入后自动触发回写（默认 true）
+
+**Response**:
+```json
+{
+    "code": 200,
+    "data": {
+        "taskId": "import_20260323_prc_001",
+        "importType": "PRICE",
+        "batchNo": "B20260323001",
+        "linkedRecordId": 1001,
+        "priceRows": [ ... ],
+        "errors": [ ... ],
+        "writebackResult": {
+            "status": "COMPLETED",
+            "totalPriceRows": 80,
+            "matchedRows": 72,
+            "unmatchedRows": 8,
+            "updatedInventoryRows": 72,
+            "unmatchedDetails": [
+                {
+                    "category": "角钢",
+                    "spec": "63*6",
+                    "origin": "天津",
+                    "price": 4300,
+                    "reason": "未在库存中找到匹配记录"
+                }
+            ]
+        }
+    }
+}
+```
+
+#### POST `/api/v1/price-writeback/execute` — 手动触发价格回写
+
+**Request**:
+```json
+{
+    "priceRecordId": 2001,
+    "inventoryRecordId": 1001,
+    "matchRuleOverride": {
+        "matchFields": ["category", "spec", "origin"],
+        "wallThicknessMatchMode": 1,
+        "specRangeMatchMode": 1
+    },
+    "writebackMode": "UPDATE_EMPTY_ONLY"
+}
+```
+
+| 字段 | 说明 |
+|------|------|
+| `priceRecordId` | 价格导入记录 ID |
+| `inventoryRecordId` | 库存导入记录 ID（可选，不传则按 batchNo 或同供应商最近一次自动查找） |
+| `matchRuleOverride` | 匹配规则覆盖（可选，不传则使用模板中的 PriceMatchRule） |
+| `writebackMode` | 回写模式：`UPDATE_EMPTY_ONLY`(仅更新无价库存) / `UPDATE_ALL`(覆盖已有价格) / `UPDATE_IF_CHANGED`(价格有变化时才更新) |
+
 #### POST `/api/v1/dynamic-import/preview`
 
 **Request**: `multipart/form-data`
@@ -1844,10 +2126,17 @@ src/
 │   │   ├── SpecRangeConfigForm.vue           // ★ v1.3 规格区间后缀匹配配置
 │   │   └── PriceMatchRuleForm.vue            // 价格匹配规则(v1.3 增强: 区间匹配策略选择)
 │   │
-│   └── import-result/
-│       ├── PreviewTable.vue                  // 导入预览表格
-│       ├── ErrorTable.vue                    // 错误明细表格
-│       └── ImportSummary.vue                 // 导入统计摘要
+│   ├── import-result/
+│   │   ├── PreviewTable.vue                  // 导入预览表格
+│   │   ├── ErrorTable.vue                    // 错误明细表格
+│   │   └── ImportSummary.vue                 // 导入统计摘要
+│   │
+│   └── price-writeback/                       // ★ v1.6 价格回写
+│       ├── BatchImportSelector.vue            // 分批导入选择器(库存/价格切换)
+│       ├── BatchNoInput.vue                   // 批次号输入/自动生成
+│       ├── InventorySelector.vue              // 库存记录选择器(回写目标)
+│       ├── WritebackResultPanel.vue           // 回写结果面板(匹配/未匹配/未赋价)
+│       └── UnpricedInventoryList.vue          // 未赋价库存列表
 │
 ├── hooks/
 │   ├── useExcelPreview.ts                    // Excel 预览状态与逻辑
@@ -3125,6 +3414,116 @@ Row 8: |          | 25*3.5 | 9     | 5.2   |
 50*100*2.0            未命中pattern                  50*100*2.0 null
 ```
 
+### 场景 12：库存与价格分批导入 + 跨批次价格回写 ★ v1.6 新增
+
+**第一步：导入库存（上午 10:00）**
+
+用户上传 `唐钢3月库存.xlsx`，选择模板，importType=1(仅库存)：
+
+```
+| 品类 | 规格   | 产地 | 材质   | 件数 | 重量  |
+|------|--------|------|--------|------|-------|
+| 槽钢 | 10#    | 唐山 | Q235B  | 10   | 12.5  |
+| 槽钢 | 12#    | 唐山 | Q235B  | 8    | 9.2   |
+| 角钢 | 50*5   | 邯郸 | Q235B  | 12   | 20.0  |
+| 角钢 | 63*6   | 天津 | Q355B  | 5    | 8.5   |
+```
+
+**系统处理**:
+1. 解析库存数据 → 4 条记录
+2. 用户确认导入
+3. 写入 `import_inventory_data`（price=null, price_source=null）
+4. 生成 batchNo = `B20260323001`
+5. 创建 `import_record`（import_type=1, batch_no=B20260323001）
+
+**此时库存数据状态**:
+```
+import_inventory_data:
+| id | batch_no     | category | spec  | origin | price | price_source |
+|----|-------------|----------|-------|--------|-------|-------------|
+| 1  | B20260323001 | 槽钢     | 10#   | 唐山   | null  | null        |
+| 2  | B20260323001 | 槽钢     | 12#   | 唐山   | null  | null        |
+| 3  | B20260323001 | 角钢     | 50*5  | 邯郸   | null  | null        |
+| 4  | B20260323001 | 角钢     | 63*6  | 天津   | null  | null        |
+```
+
+---
+
+**第二步：导入价格（下午 14:00）**
+
+用户上传 `唐钢3月报价.xlsx`，选择模板，importType=2(仅价格)，指定 batchNo=`B20260323001`：
+
+```
+| 品类 | 规格   | 产地 | 单价  |
+|------|--------|------|-------|
+| 槽钢 | 10#    | 唐山 | 4200  |
+| 槽钢 | 12#    | 唐山 | 4350  |
+| 角钢 | 50*5   | 邯郸 | 4100  |
+| 工字钢| 20#    | 唐山 | 4500  |  ← 库存中没有此规格
+```
+
+**系统处理**:
+1. 解析价格数据 → 4 条记录
+2. 触发 PriceWritebackExecutor:
+   a. 从 DB 加载 batchNo=B20260323001 的库存(4 条)
+   b. 构建索引: matchKey = category + "|" + spec + "|" + origin
+   c. 逐条匹配:
+      - 槽钢|10#|唐山 → 命中库存 id=1 → UPDATE price=4200
+      - 槽钢|12#|唐山 → 命中库存 id=2 → UPDATE price=4350
+      - 角钢|50*5|邯郸 → 命中库存 id=3 → UPDATE price=4100
+      - 工字钢|20#|唐山 → 未命中 → 记录到 unmatchedList
+3. 批量 UPDATE import_inventory_data
+4. 角钢|63*6|天津 库存无匹配价格 → 仍为 null
+
+**回写后库存数据状态**:
+```
+import_inventory_data:
+| id | category | spec  | origin | price  | price_source | price_record_id |
+|----|----------|-------|--------|--------|-------------|-----------------|
+| 1  | 槽钢     | 10#   | 唐山   | 4200   | 1(跨批次)   | 2001            |
+| 2  | 槽钢     | 12#   | 唐山   | 4350   | 1           | 2001            |
+| 3  | 角钢     | 50*5  | 邯郸   | 4100   | 1           | 2001            |
+| 4  | 角钢     | 63*6  | 天津   | null   | null        | null            | ← 未赋价
+```
+
+**回写结果报告**:
+```json
+{
+    "status": "COMPLETED",
+    "totalPriceRows": 4,
+    "matchedRows": 3,
+    "unmatchedRows": 1,
+    "updatedInventoryRows": 3,
+    "remainingUnpricedRows": 1,
+    "unmatchedDetails": [
+        { "category": "工字钢", "spec": "20#", "origin": "唐山", "price": 4500,
+          "reason": "未在批次B20260323001的库存中找到匹配记录" }
+    ],
+    "unpricedDetails": [
+        { "id": 4, "category": "角钢", "spec": "63*6", "origin": "天津",
+          "reason": "价格表中无此规格的报价" }
+    ]
+}
+```
+
+---
+
+**场景 12b：不指定批次号，自动关联最近库存**
+
+用户上传价格表时不填 batchNo，系统自动查找同供应商最近一次已确认的库存导入记录：
+
+```
+SELECT id, batch_no FROM import_record
+WHERE supplier_id = 1001
+  AND import_type = 1
+  AND import_status = 1
+  AND deleted = 0
+ORDER BY create_time DESC
+LIMIT 1
+```
+
+找到后自动关联并执行回写，流程与上方一致。
+
 ---
 
 ## 十二、安全与健壮性设计
@@ -3192,6 +3591,7 @@ public class SafeConvertUtil {
 | `RowInheritResolverTest` | 完整规格/部分值/连续部分值/前缀切换/空值/首行即部分值 |
 | `SpecRangeParserTest` | ★ v1.3 括号解析、各种区间表达(以上/以下/+/∞/数字-数字)、无区间规格、全半角括号混用、解析失败容错 |
 | `PriceMatcherTest` | 精确匹配、壁厚区间匹配、★ v1.3 规格区间匹配(四种策略)、库存无区间回退、base规格不等短路 |
+| `PriceWritebackExecutorTest` | ★ v1.6 跨批次回写:按batchNo/按supplierId自动查找/三种writebackMode/并发锁/未匹配报告/未赋价统计 |
 | `MergeCellCollectorTest` | 合并区域填充、边界条件 |
 | `SafeConvertUtilTest` | 各种异常字符串的安全转换 |
 | `DynamicExcelParserTest` | 完整的端到端解析测试(含样本 Excel) |
@@ -4209,9 +4609,12 @@ import_template (1) ──┬──< import_template_sheet (N)
                       │
                       └── 关联 supplier(供应商)
 
-import_record (1) ──< import_reconciliation (0..1)                ← v1.4 数据对账
-                              │
-                              └──< import_reconciliation_detail (N)
+import_record (1) ──┬──< import_reconciliation (0..1)              ← v1.4 数据对账
+                    │         │
+                    │         └──< import_reconciliation_detail (N)
+                    │
+                    └──< import_inventory_data (N)                  ← v1.6 已入库库存数据
+                              (price 字段由 PriceWritebackExecutor 回写)
 
 import_async_task (独立)                                           ← v1.4 异步导入
 
@@ -4231,3 +4634,4 @@ import_reconciliation_alert_rule (独立)                             ← v1.4 �
 | 14 | `import_reconciliation` | 数据对账 | 对账记录(汇总统计) |
 | 15 | `import_reconciliation_detail` | 数据对账 | 对账明细(逐条变更记录) |
 | 16 | `import_reconciliation_alert_rule` | 数据对账 | 告警规则(阈值+通知方式) |
+| 17 | `import_inventory_data` | 分批导入 | v1.6 已入库库存数据(价格回写目标) |
