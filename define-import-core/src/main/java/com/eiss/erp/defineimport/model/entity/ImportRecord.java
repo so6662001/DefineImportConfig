@@ -27,6 +27,8 @@ public class ImportRecord {
 
     private Long supplierId;
 
+    private String supplierName;
+
     private String fileName;
 
     private String filePath;

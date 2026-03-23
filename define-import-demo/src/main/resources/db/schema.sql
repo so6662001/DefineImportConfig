@@ -134,6 +134,7 @@ CREATE TABLE IF NOT EXISTS import_record (
     template_id             BIGINT          NOT NULL,
     template_code           VARCHAR(64)     NOT NULL,
     supplier_id             BIGINT          DEFAULT NULL,
+    supplier_name           VARCHAR(128)    DEFAULT NULL,
     file_name               VARCHAR(256)    NOT NULL,
     file_path               VARCHAR(512)    NOT NULL,
     import_type             TINYINT         NOT NULL DEFAULT 0,
