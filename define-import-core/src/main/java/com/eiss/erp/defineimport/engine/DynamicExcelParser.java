@@ -44,6 +44,19 @@ public class DynamicExcelParser {
      * @return ImportPreviewResult with parsed rows and errors
      */
     public ImportPreviewResult parse(InputStream inputStream, ImportTemplateDto templateDto) {
+        return parse(inputStream, templateDto, null);
+    }
+
+    /**
+     * Parse an Excel file using the given template configuration and global preset char rules.
+     *
+     * @param inputStream      Excel file input stream
+     * @param templateDto      complete template config (sheets, groups, fields, mappings, etc.)
+     * @param presetCharRules  DB 或调用方提供的全局字符转换预设（可为 null）
+     * @return ImportPreviewResult with parsed rows and errors
+     */
+    public ImportPreviewResult parse(InputStream inputStream, ImportTemplateDto templateDto,
+                                      List<CharTransformConfig.CharRule> presetCharRules) {
         byte[] fileBytes = toByteArray(inputStream);
 
         List<SheetConfigDto> sheets = templateDto.getSheets();
@@ -51,48 +64,44 @@ public class DynamicExcelParser {
             return buildEmptyResult(templateDto.getTemplateName());
         }
 
-        sheets.sort(Comparator.comparingInt(s -> s.getSortOrder() != null ? s.getSortOrder() : Integer.MAX_VALUE));
+        Comparator<SheetConfigDto> bySortOrder = Comparator.comparingInt(
+                s -> s.getSortOrder() != null ? s.getSortOrder() : Integer.MAX_VALUE);
+        sheets.sort(Comparator
+                .comparingInt((SheetConfigDto s) -> {
+                    if (s.getContentType() == null) {
+                        return 2;
+                    }
+                    if (s.getContentType() == ContentTypeEnum.INVENTORY.getCode()) {
+                        return 0;
+                    }
+                    if (s.getContentType() == ContentTypeEnum.PRICE.getCode()) {
+                        return 1;
+                    }
+                    return 2;
+                })
+                .thenComparing(bySortOrder));
+
+        List<SheetConfigDto> inventorySheets = sheets.stream()
+                .filter(s -> s.getContentType() != null
+                        && s.getContentType() == ContentTypeEnum.INVENTORY.getCode())
+                .collect(Collectors.toList());
+        List<SheetConfigDto> nonInventorySheets = sheets.stream()
+                .filter(s -> s.getContentType() == null
+                        || s.getContentType() != ContentTypeEnum.INVENTORY.getCode())
+                .collect(Collectors.toList());
 
         List<ParsedRowDto> allInventoryRows = new ArrayList<>();
         List<ParsedRowDto> allPriceRows = new ArrayList<>();
         List<ExcelImportError> allErrors = new ArrayList<>();
         DuplicateDetector duplicateDetector = new DuplicateDetector();
 
-        for (SheetConfigDto sheetConfig : sheets) {
-            int sheetIdx = sheetConfig.getSheetIndex() != null ? sheetConfig.getSheetIndex() : 0;
-
-            // --- First pass: collect merge cells and all cell values ---
-            MergeCellCollector mergeCellCollector = new MergeCellCollector();
-            Map<Integer, String> headerRowData = new HashMap<>();
-            firstPass(fileBytes, sheetIdx, sheetConfig, mergeCellCollector, headerRowData);
-
-            // --- Build header column mapping ---
-            Map<String, ColumnSourceConfig> fieldColumnConfigs = extractColumnSourceConfigs(sheetConfig);
-            Map<String, Integer> headerColumnMap = HeaderMatcher.match(headerRowData, fieldColumnConfigs);
-
-            // --- Build char transform pipelines ---
-            Map<String, List<CharTransformConfig.CharRule>> charPipelineCache =
-                    buildCharPipelines(sheetConfig, templateDto.getTemplateCharRules());
-
-            // --- Second pass: stream parse data rows ---
-            DynamicExcelListener listener = new DynamicExcelListener(
-                    sheetConfig, mergeCellCollector, headerRowData,
-                    headerColumnMap, charPipelineCache, duplicateDetector);
-
-            EasyExcel.read(new ByteArrayInputStream(fileBytes), listener)
-                    .sheet(sheetIdx)
-                    .headRowNumber(0)
-                    .doRead();
-
-            // Separate by content type
-            boolean isInventory = sheetConfig.getContentType() != null
-                    && sheetConfig.getContentType() == ContentTypeEnum.INVENTORY.getCode();
-            if (isInventory) {
-                allInventoryRows.addAll(listener.getParsedRows());
-            } else {
-                allPriceRows.addAll(listener.getParsedRows());
-            }
-            allErrors.addAll(listener.getErrors());
+        for (SheetConfigDto sheetConfig : inventorySheets) {
+            parseOneSheet(fileBytes, sheetConfig, templateDto, presetCharRules, duplicateDetector,
+                    allInventoryRows, allPriceRows, allErrors);
+        }
+        for (SheetConfigDto sheetConfig : nonInventorySheets) {
+            parseOneSheet(fileBytes, sheetConfig, templateDto, presetCharRules, duplicateDetector,
+                    allInventoryRows, allPriceRows, allErrors);
         }
 
         // Price matching: fill prices into inventory rows
@@ -117,6 +126,45 @@ public class DynamicExcelParser {
 
         return buildResult(templateDto.getTemplateName(), sheets,
                 allInventoryRows, allPriceRows, allErrors, duplicateDetector);
+    }
+
+    private void parseOneSheet(byte[] fileBytes,
+                               SheetConfigDto sheetConfig,
+                               ImportTemplateDto templateDto,
+                               List<CharTransformConfig.CharRule> presetCharRules,
+                               DuplicateDetector duplicateDetector,
+                               List<ParsedRowDto> allInventoryRows,
+                               List<ParsedRowDto> allPriceRows,
+                               List<ExcelImportError> allErrors) {
+        int sheetIdx = sheetConfig.getSheetIndex() != null ? sheetConfig.getSheetIndex() : 0;
+
+        MergeCellCollector mergeCellCollector = new MergeCellCollector();
+        Map<Integer, String> headerRowData = new HashMap<>();
+        firstPass(fileBytes, sheetIdx, sheetConfig, mergeCellCollector, headerRowData);
+
+        Map<String, ColumnSourceConfig> fieldColumnConfigs = extractColumnSourceConfigs(sheetConfig);
+        Map<String, Integer> headerColumnMap = HeaderMatcher.match(headerRowData, fieldColumnConfigs);
+
+        Map<String, List<CharTransformConfig.CharRule>> charPipelineCache =
+                buildCharPipelines(sheetConfig, templateDto.getTemplateCharRules(), presetCharRules);
+
+        DynamicExcelListener listener = new DynamicExcelListener(
+                sheetConfig, mergeCellCollector, headerRowData,
+                headerColumnMap, charPipelineCache, duplicateDetector);
+
+        EasyExcel.read(new ByteArrayInputStream(fileBytes), listener)
+                .sheet(sheetIdx)
+                .headRowNumber(0)
+                .doRead();
+
+        boolean isInventory = sheetConfig.getContentType() != null
+                && sheetConfig.getContentType() == ContentTypeEnum.INVENTORY.getCode();
+        if (isInventory) {
+            allInventoryRows.addAll(listener.getParsedRows());
+        } else {
+            allPriceRows.addAll(listener.getParsedRows());
+        }
+        allErrors.addAll(listener.getErrors());
     }
 
     /**
@@ -175,7 +223,9 @@ public class DynamicExcelParser {
      * Build char transform pipelines for each field in the sheet.
      */
     private Map<String, List<CharTransformConfig.CharRule>> buildCharPipelines(
-            SheetConfigDto sheetConfig, List<CharTransformConfig.CharRule> templateRules) {
+            SheetConfigDto sheetConfig,
+            List<CharTransformConfig.CharRule> templateRules,
+            List<CharTransformConfig.CharRule> presetCharRules) {
         Map<String, List<CharTransformConfig.CharRule>> cache = new HashMap<>();
         if (sheetConfig.getGroups() == null) {
             return cache;
@@ -194,14 +244,53 @@ public class DynamicExcelParser {
                     } catch (Exception ignored) {
                     }
                 }
+                List<CharTransformConfig.CharRule> templateRulesForField =
+                        filterTemplateCharRulesForField(templateRules, field.getFieldCode());
                 List<CharTransformConfig.CharRule> pipeline =
-                        CharTransformer.buildPipeline(null, templateRules, fieldCharConfig);
+                        CharTransformer.buildPipeline(presetCharRules, templateRulesForField, fieldCharConfig);
                 if (!pipeline.isEmpty()) {
                     cache.put(field.getFieldCode(), pipeline);
                 }
             }
         }
         return cache;
+    }
+
+    /**
+     * Template char rules may restrict {@code applyFieldCodes} to specific field codes.
+     * Blank or null means the rule applies to all fields.
+     */
+    private static List<CharTransformConfig.CharRule> filterTemplateCharRulesForField(
+            List<CharTransformConfig.CharRule> templateRules, String fieldCode) {
+        if (templateRules == null || templateRules.isEmpty()) {
+            return templateRules != null ? templateRules : Collections.emptyList();
+        }
+        List<CharTransformConfig.CharRule> out = new ArrayList<>();
+        for (CharTransformConfig.CharRule rule : templateRules) {
+            if (rule == null) {
+                continue;
+            }
+            if (templateCharRuleAppliesToField(rule, fieldCode)) {
+                out.add(rule);
+            }
+        }
+        return out;
+    }
+
+    private static boolean templateCharRuleAppliesToField(CharTransformConfig.CharRule rule, String fieldCode) {
+        String codes = rule.getApplyFieldCodes();
+        if (codes == null || codes.isBlank()) {
+            return true;
+        }
+        if (fieldCode == null) {
+            return false;
+        }
+        for (String code : codes.split(",")) {
+            if (fieldCode.equals(code.trim())) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

@@ -41,6 +41,8 @@ public class ImportTemplateServiceImpl implements ImportTemplateService {
     @Autowired
     private ImportTemplateCharRuleMapper charRuleMapper;
     @Autowired
+    private ImportCharRulePresetMapper charRulePresetMapper;
+    @Autowired
     private ImportTemplatePriceMatchRuleMapper priceMatchRuleMapper;
 
     @Override
@@ -131,12 +133,29 @@ public class ImportTemplateServiceImpl implements ImportTemplateService {
                 .filter(f -> f.getGroupId() != null)
                 .collect(Collectors.groupingBy(ImportTemplateField::getGroupId));
 
+        // Sheet-wide fields (group_id = null): apply to every group on that sheet
+        Map<Long, List<ImportTemplateField>> fieldsBySheetWithoutGroup = fieldEntities.stream()
+                .filter(f -> f.getGroupId() == null && f.getSheetConfigId() != null)
+                .collect(Collectors.groupingBy(ImportTemplateField::getSheetConfigId));
+
         // Index value mappings by groupId
         Map<Long, List<ImportTemplateFieldValueMapping>> mappingsByGroup = valueMappingEntities.stream()
                 .filter(m -> m.getGroupId() != null)
                 .collect(Collectors.groupingBy(ImportTemplateFieldValueMapping::getGroupId));
 
-        // Index price rules by sheetConfigId
+        // Sheet-wide value mappings (group_id = null)
+        Map<Long, List<ImportTemplateFieldValueMapping>> mappingsBySheetWithoutGroup =
+                valueMappingEntities.stream()
+                        .filter(m -> m.getGroupId() == null && m.getSheetConfigId() != null)
+                        .collect(Collectors.groupingBy(ImportTemplateFieldValueMapping::getSheetConfigId));
+
+        // Template-level default price rule (sheet_config_id = null)
+        ImportTemplatePriceMatchRule templateDefaultPriceRule = priceRuleEntities.stream()
+                .filter(r -> r.getSheetConfigId() == null)
+                .findFirst()
+                .orElse(null);
+
+        // Index per-sheet price rules
         Map<Long, ImportTemplatePriceMatchRule> priceRuleBySheet = priceRuleEntities.stream()
                 .filter(r -> r.getSheetConfigId() != null)
                 .collect(Collectors.toMap(ImportTemplatePriceMatchRule::getSheetConfigId,
@@ -147,21 +166,40 @@ public class ImportTemplateServiceImpl implements ImportTemplateService {
             SheetConfigDto sheetDto = toSheetDto(sheetEntity);
 
             List<ImportTemplateGroup> groups = groupsBySheet.getOrDefault(sheetEntity.getId(), Collections.emptyList());
+            groups.sort(Comparator.comparing(ImportTemplateGroup::getGroupSeq,
+                    Comparator.nullsLast(Integer::compareTo)));
+
+            List<ImportTemplateField> sheetWideFields =
+                    fieldsBySheetWithoutGroup.getOrDefault(sheetEntity.getId(), Collections.emptyList());
+            List<ImportTemplateFieldValueMapping> sheetWideMappings =
+                    mappingsBySheetWithoutGroup.getOrDefault(sheetEntity.getId(), Collections.emptyList());
+
             List<GroupConfigDto> groupDtos = new ArrayList<>();
             for (ImportTemplateGroup groupEntity : groups) {
                 GroupConfigDto groupDto = toGroupDto(groupEntity);
 
-                List<ImportTemplateField> fields = fieldsByGroup.getOrDefault(groupEntity.getId(), Collections.emptyList());
+                List<ImportTemplateField> fields = new ArrayList<>(
+                        fieldsByGroup.getOrDefault(groupEntity.getId(), Collections.emptyList()));
+                fields.addAll(sheetWideFields);
+                fields.sort(Comparator.comparing(ImportTemplateField::getSortOrder,
+                        Comparator.nullsLast(Integer::compareTo)));
                 groupDto.setFields(fields.stream().map(this::toFieldDto).collect(Collectors.toList()));
 
-                groupDto.setFieldValueMappings(
+                List<ImportTemplateFieldValueMapping> mergedMappings = new ArrayList<>(
                         mappingsByGroup.getOrDefault(groupEntity.getId(), Collections.emptyList()));
+                mergedMappings.addAll(sheetWideMappings);
+                mergedMappings.sort(Comparator.comparing(ImportTemplateFieldValueMapping::getSortOrder,
+                        Comparator.nullsLast(Integer::compareTo)));
+                groupDto.setFieldValueMappings(mergedMappings);
 
                 groupDtos.add(groupDto);
             }
             sheetDto.setGroups(groupDtos);
 
             ImportTemplatePriceMatchRule priceRule = priceRuleBySheet.get(sheetEntity.getId());
+            if (priceRule == null) {
+                priceRule = templateDefaultPriceRule;
+            }
             if (priceRule != null) {
                 sheetDto.setPriceMatchRule(toPriceMatchRuleDto(priceRule));
             }
@@ -170,8 +208,22 @@ public class ImportTemplateServiceImpl implements ImportTemplateService {
         }
         dto.setSheets(sheetDtos);
 
+        Set<Long> presetRuleIds = charRuleEntities.stream()
+                .map(ImportTemplateCharRule::getPresetRuleId)
+                .filter(Objects::nonNull)
+                .collect(Collectors.toSet());
+        Map<Long, ImportCharRulePreset> presetById = new HashMap<>();
+        if (!presetRuleIds.isEmpty()) {
+            for (ImportCharRulePreset preset : charRulePresetMapper.selectBatchIds(presetRuleIds)) {
+                if (preset != null && preset.getId() != null) {
+                    presetById.put(preset.getId(), preset);
+                }
+            }
+        }
+
+        Map<Long, ImportCharRulePreset> presetByIdFinal = presetById;
         dto.setTemplateCharRules(charRuleEntities.stream()
-                .map(this::toCharRule)
+                .map(e -> toCharRule(e, presetByIdFinal))
                 .collect(Collectors.toList()));
 
         return dto;
@@ -200,6 +252,8 @@ public class ImportTemplateServiceImpl implements ImportTemplateService {
             for (CharTransformConfig.CharRule rule : dto.getTemplateCharRules()) {
                 ImportTemplateCharRule entity = new ImportTemplateCharRule();
                 entity.setTemplateId(templateId);
+                entity.setApplyFieldCodes(rule.getApplyFieldCodes());
+                entity.setPresetRuleId(rule.getPresetRuleId());
                 entity.setMatchType(rule.getMatchType());
                 entity.setMatchPattern(rule.getMatchPattern());
                 entity.setReplaceValue(rule.getReplaceValue());
@@ -412,13 +466,30 @@ public class ImportTemplateServiceImpl implements ImportTemplateService {
         return dto;
     }
 
-    private CharTransformConfig.CharRule toCharRule(ImportTemplateCharRule entity) {
+    private CharTransformConfig.CharRule toCharRule(ImportTemplateCharRule entity,
+            Map<Long, ImportCharRulePreset> presetById) {
         CharTransformConfig.CharRule rule = new CharTransformConfig.CharRule();
-        rule.setMatchType(entity.getMatchType());
-        rule.setMatchPattern(entity.getMatchPattern());
-        rule.setReplaceValue(entity.getReplaceValue());
+        rule.setApplyFieldCodes(entity.getApplyFieldCodes());
+        rule.setPresetRuleId(entity.getPresetRuleId());
         rule.setSortOrder(entity.getSortOrder());
         rule.setDescription(entity.getDescription());
+
+        if (entity.getPresetRuleId() != null) {
+            ImportCharRulePreset preset = presetById != null ? presetById.get(entity.getPresetRuleId()) : null;
+            if (preset != null) {
+                rule.setMatchType(preset.getMatchType());
+                rule.setMatchPattern(preset.getMatchPattern());
+                rule.setReplaceValue(preset.getReplaceValue());
+            } else {
+                rule.setMatchType(entity.getMatchType());
+                rule.setMatchPattern(entity.getMatchPattern());
+                rule.setReplaceValue(entity.getReplaceValue());
+            }
+        } else {
+            rule.setMatchType(entity.getMatchType());
+            rule.setMatchPattern(entity.getMatchPattern());
+            rule.setReplaceValue(entity.getReplaceValue());
+        }
         return rule;
     }
 }

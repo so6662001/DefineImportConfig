@@ -22,5 +22,9 @@ public class CharTransformConfig {
         private String replaceValue;
         private Integer sortOrder;
         private String description;
+        /** Comma-separated field codes; when set, rule applies only to those fields (see pipeline build). */
+        private String applyFieldCodes;
+        /** When set, match/replace may be resolved from import_char_rule_preset at load time. */
+        private Long presetRuleId;
     }
 }
