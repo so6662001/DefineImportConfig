@@ -1,8 +1,9 @@
 # 钢贸动态 Excel 导入系统 — 详细设计文档
 
-> 版本：v1.1  
+> 版本：v1.2  
 > 技术栈：Java 17 + Spring Boot + Alibaba EasyExcel + MyBatis-Plus + MySQL + Vue 3  
-> v1.1 变更：新增「规格特殊符号转换」子系统设计（第三章新增表、第 3.3.3 节、第五章新增引擎类、第七章新增组件、第十一章新增场景5）  
+> v1.1 变更：新增「规格特殊符号转换」子系统设计  
+> v1.2 变更：① 品类映射泛化为通用字段值映射（支持品类/产地/材质）② 新增规格行间继承机制 ③ 增强数值提取能力 ④ 完善一行多品类多产地价格分组 ⑤ 新增场景 6-10  
 
 ---
 
@@ -24,6 +25,11 @@
 | 价格列灵活 | 表头是产地/材质名称，表体是价格，一个 Sheet 可有多产地、多材质 |
 | 规格特殊符号 | 规格中存在大量特殊符号需要归一化：全角×→半角*、Φ/φ/∅→清除、中文括号→英文括号、异形连字符→标准连字符等 |
 | 规格组合 | 规格 = 多列拼接（如规格 + 壁厚），壁厚可能是区间值 |
+| 规格行间继承 | 同列下一行只有壁厚值（如"2.5"），需继承上行规格前缀拼接为完整规格（如"20*2.5"） |
+| 包装数量混合文本 | 包装形式写为"127支/件"，需提取纯数字 127 |
+| 产地/材质灵活 | 产地和材质也存在类似品类的映射规则，如表头限定词派生、固定单元格指定等 |
+| 一行多品类价格 | 同一行存在多个品类的价格列（如"焊管"列 + "华岐(镀锌管)"列 + "中天(镀锌管)"列），每列是独立品类+产地的价格 |
+| 库存冷热水分组 | 钢塑管等品类中"冷水"和"热水"是两个品类，同一 Sheet 需按区域分组读取 |
 
 ### 1.2 核心目标
 
@@ -39,32 +45,36 @@
 ## 二、核心概念模型
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                      ImportTemplate (导入模板)                   │
-│  ┌─ template_code, supplier_id, all_sheets_price               │
-│  │                                                              │
-│  ├── SheetConfig (Sheet页配置) ×N                               │
-│  │   ┌─ sheet_index, content_type(库存/价格)                    │
-│  │   │  header_row_index, data_start/end_row                   │
-│  │   │                                                          │
-│  │   ├── DataGroup (数据组) ×M                                  │
-│  │   │   ┌─ group_seq, group_name                              │
-│  │   │   │                                                      │
-│  │   │   ├── FieldMapping (字段映射) ×K                         │
-│  │   │   │   ┌─ field_code(品类/规格/产地/...)                  │
-│  │   │   │   │  source_type(COLUMN/FIXED_CELL/...)             │
-│  │   │   │   │  source_config(JSON)                            │
-│  │   │   │   └─ transform_config(JSON)                         │
-│  │   │   │                                                      │
-│  │   │   └── CategoryMapping (品类映射) ×L                      │
-│  │   │       ┌─ source_category + qualifier → target_category  │
-│  │   │       └─ 如: "方管"+"白材" → "镀锌方管"                  │
-│  │   │                                                          │
-│  │   └── PriceMatchRule (价格匹配规则)                           │
-│  │       ┌─ match_fields, wall_thickness_range                  │
-│  │       └─ 用于价格→库存的关联匹配                              │
-│  └──────────────────────────────────────────────────────────────│
-└─────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                      ImportTemplate (导入模板)                        │
+│  ┌─ template_code, supplier_id, all_sheets_price                    │
+│  │                                                                   │
+│  ├── SheetConfig (Sheet页配置) ×N                                    │
+│  │   ┌─ sheet_index, content_type(库存/价格)                         │
+│  │   │  header_row_index, data_start/end_row                        │
+│  │   │                                                               │
+│  │   ├── DataGroup (数据组) ×M                                       │
+│  │   │   ┌─ group_seq, group_name                                   │
+│  │   │   │  fixed_category / fixed_origin / fixed_material          │
+│  │   │   │                                                           │
+│  │   │   ├── FieldMapping (字段映射) ×K                              │
+│  │   │   │   ┌─ field_code(品类/规格/产地/...)                       │
+│  │   │   │   │  source_type(COLUMN/FIXED_CELL/...)                  │
+│  │   │   │   │  source_config(JSON)                                 │
+│  │   │   │   │  transform_config(JSON, 含行间继承/数值提取等)         │
+│  │   │   │   └─ inherit_config(JSON, 规格行间继承)                   │
+│  │   │   │                                                           │
+│  │   │   └── FieldValueMapping (字段值映射) ×L    ← v1.2 泛化        │
+│  │   │       ┌─ target_field(category/origin/material)              │
+│  │   │       │  source_value + qualifier → target_value             │
+│  │   │       └─ 如: "方管"+"白材" → "镀锌方管"                       │
+│  │   │           "焊管"(表头) → 产地:"焊管厂"                        │
+│  │   │                                                               │
+│  │   └── PriceMatchRule (价格匹配规则)                                │
+│  │       ┌─ match_fields, wall_thickness_range                       │
+│  │       └─ 用于价格→库存的关联匹配                                   │
+│  └───────────────────────────────────────────────────────────────────│
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
 ### 2.1 关键概念说明
@@ -75,8 +85,14 @@
 
 - **价格表多产地列**：品类列 + 规格列 + 黑材价格列 + 白材价格列。"黑材"和"白材"各生成一组数据，品类分别派生为"方管"和"镀锌方管"
 - **同一 Sheet 多品类区域**：上半部分是"槽钢"库存，下半部分是"角钢"库存
+- **库存冷热水分组**：钢塑管的"冷水"和"热水"是不同品类，通过分组各自定义品类
+- **一行多品类价格**：如 `规格|壁厚|焊管(价格)|华岐(价格)|中天(价格)`，三列分别对应三个品类+产地组合，需定义三个数据组
 
-每个数据组可拥有独立的字段映射规则，也可共享 Sheet 级别的公共映射。
+每个数据组可拥有独立的字段映射规则，也可共享 Sheet 级别的公共映射（`group_id=null` 的字段适用于所有组）。
+
+**数据组的关键属性（v1.2 增强）**：
+- 每个组可直接指定 `fixed_category`、`fixed_origin`、`fixed_material`（组级固定值，无需再定义字段映射）
+- 组的字段映射优先于组级固定值（字段映射存在时覆盖固定值）
 
 #### 字段数据来源类型 (SourceType)
 
@@ -88,17 +104,36 @@
 | `COMPOSITE` | 多来源组合拼接 | 规格 = 列1 + "*" + 列2 |
 | `COLUMN_HEADER` | 列的表头文本即为值 | 表头是产地名称，表体是价格 |
 
-#### 品类映射 (CategoryMapping)
+#### 字段值映射 (FieldValueMapping) — v1.2 泛化
 
-当品类需要根据 **限定词(qualifier)** 派生时使用：
+> v1.1 中此功能仅支持品类(CategoryMapping)，v1.2 泛化为**通用字段值映射**，支持品类、产地、材质三个字段。
+
+当品类/产地/材质需要根据 **限定词(qualifier)** 派生时使用：
 
 ```
-原始品类(品类列值) + 限定词(如表头文字) → 目标品类
-─────────────────────────────────────────────────
-"方管"           + "黑材"                → "方管"
-"方管"           + "白材"                → "镀锌方管"
-"圆管"           + "黑材"                → "圆管"
-"圆管"           + "白材"                → "镀锌圆管"
+目标字段   原始值(列值/表头)    + 限定词(如表头文字)    → 目标值
+──────────────────────────────────────────────────────────────
+category  "方管"              + "黑材"                → "方管"
+category  "方管"              + "白材"                → "镀锌方管"
+category  null(无品类列)       + "焊管"(表头)          → "焊管"
+category  null                + "华岐"(表头)          → "镀锌管"
+origin    null                + "华岐"(表头)          → "华岐"
+origin    "津西"              + null                  → "天津津西"
+material  null                + "Q235B"(表头)         → "Q235B"
+```
+
+#### 规格行间继承 (RowInherit) — v1.2 新增
+
+当规格列的某行仅包含壁厚值（如"2.5"），需要继承上一行的规格前缀，组合为完整规格。
+
+```
+Excel 原始值        继承后
+──────────────────────────
+20*2.0              20*2.0        ← 完整规格, 记录前缀 "20"
+2.5                 20*2.5        ← 仅壁厚, 继承上行前缀 "20" + "*" + "2.5"
+1.8                 20*1.8        ← 继承前缀
+25*3.0              25*3.0        ← 新的完整规格, 更新前缀为 "25"
+2.0                 25*2.0        ← 继承 "25"
 ```
 
 ---
@@ -114,7 +149,7 @@ import_template (1) ──┬──< import_template_sheet (N)
                       │         │         │
                       │         │         ├──< import_template_field (K)
                       │         │         │
-                      │         │         └──< import_template_category_mapping (L)
+                      │         │         └──< import_template_field_value_mapping (L)  ← v1.2 泛化(品类+产地+材质)
                       │         │
                       │         └──< import_template_price_match_rule (0..1)
                       │
@@ -183,7 +218,12 @@ CREATE TABLE `import_template_group` (
     `template_id`       BIGINT          NOT NULL                 COMMENT '模板ID',
     `sheet_config_id`   BIGINT          NOT NULL                 COMMENT 'Sheet配置ID',
     `group_seq`         INT             NOT NULL DEFAULT 1       COMMENT '组序号(同一Sheet内从1递增)',
-    `group_name`        VARCHAR(128)    DEFAULT NULL             COMMENT '组名称(便于识别)',
+    `group_name`        VARCHAR(128)    DEFAULT NULL             COMMENT '组名称(便于识别, 如"冷水钢塑管"、"焊管价格")',
+    `fixed_category`    VARCHAR(128)    DEFAULT NULL             COMMENT '组级固定品类(如"焊管"、"镀锌管"), 字段映射存在时被覆盖',
+    `fixed_origin`      VARCHAR(128)    DEFAULT NULL             COMMENT '组级固定产地(如"华岐"、"中天")',
+    `fixed_material`    VARCHAR(128)    DEFAULT NULL             COMMENT '组级固定材质(如"Q235B")',
+    `data_start_row`    INT             DEFAULT NULL             COMMENT '组数据起始行(null=使用Sheet级配置)',
+    `data_end_row`      INT             DEFAULT NULL             COMMENT '组数据结束行(null=使用Sheet级配置)',
     `remark`            VARCHAR(256)    DEFAULT NULL             COMMENT '备注',
     `create_time`       DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
     `update_time`       DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -220,23 +260,26 @@ CREATE TABLE `import_template_field` (
 
 
 -- ============================================================
--- 5. 品类映射规则表
+-- 5. 字段值映射规则表 (v1.2 从 category_mapping 泛化而来, 支持品类/产地/材质)
 -- ============================================================
-CREATE TABLE `import_template_category_mapping` (
+CREATE TABLE `import_template_field_value_mapping` (
     `id`                BIGINT          NOT NULL AUTO_INCREMENT  COMMENT '主键',
     `template_id`       BIGINT          NOT NULL                 COMMENT '模板ID',
     `sheet_config_id`   BIGINT          NOT NULL                 COMMENT 'Sheet配置ID',
     `group_id`          BIGINT          DEFAULT NULL             COMMENT '数据组ID',
-    `source_category`   VARCHAR(128)    DEFAULT NULL             COMMENT '原始品类值(null表示匹配任意)',
-    `qualifier`         VARCHAR(128)    DEFAULT NULL             COMMENT '限定词(如表头文字: 黑材/白材)',
-    `target_category`   VARCHAR(128)    NOT NULL                 COMMENT '目标品类名称',
+    `target_field`      VARCHAR(64)     NOT NULL                 COMMENT '目标字段编码: category/origin/material',
+    `source_value`      VARCHAR(128)    DEFAULT NULL             COMMENT '原始值(null表示匹配任意)',
+    `qualifier`         VARCHAR(128)    DEFAULT NULL             COMMENT '限定词(如表头文字: 黑材/白材/华岐)',
+    `target_value`      VARCHAR(128)    NOT NULL                 COMMENT '目标值(映射后的值)',
+    `sort_order`        INT             NOT NULL DEFAULT 0       COMMENT '匹配优先级(越小越优先)',
     `remark`            VARCHAR(256)    DEFAULT NULL,
     `create_time`       DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
     `update_time`       DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     `deleted`           TINYINT         NOT NULL DEFAULT 0,
     PRIMARY KEY (`id`),
+    KEY `idx_group_id` (`group_id`),
     KEY `idx_template_sheet` (`template_id`, `sheet_config_id`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='品类映射规则表';
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='字段值映射规则表';
 
 
 -- ============================================================
@@ -439,6 +482,7 @@ INSERT INTO `import_char_rule_preset` (`rule_code`, `rule_name`, `rule_group`, `
     "rangeDelimiter": "-",
     "parseAsRange": false,
     "regexExtract": null,
+    "extractNumber": false,
 
     "charTransform": {
         "useTemplateRules": true,
@@ -448,6 +492,14 @@ INSERT INTO `import_char_rule_preset` (`rule_code`, `rule_name`, `rule_group`, `
             { "matchType": "REGEX", "matchPattern": "(?<=\\d)[xX](?=\\d)", "replaceValue": "*" }
         ],
         "excludePresetCodes": ["HASH_SIGN"]
+    },
+
+    "rowInherit": {
+        "enabled": true,
+        "separator": "*",
+        "partialPattern": "^[\\d.]+$",
+        "inheritPart": "PREFIX",
+        "assembleTemplate": "${prefix}*${current}"
     }
 }
 ```
@@ -456,11 +508,27 @@ INSERT INTO `import_char_rule_preset` (`rule_code`, `rule_name`, `rule_group`, `
 |------|------|
 | `trimWhitespace` | 去除首尾空白 |
 | `removeUnit` | 移除单位文字 |
+| `unitPatterns` | 需移除的单位列表 |
 | `numericPrecision` | 数值精度(小数位) |
 | `parseAsRange` | 是否解析为区间值(壁厚场景) |
 | `rangeDelimiter` | 区间分隔符(如 "-") |
-| `regexExtract` | 正则提取(提取规格中的数字部分等) |
+| `regexExtract` | 正则提取(使用第一个捕获组) |
+| `extractNumber` | **★ v1.2** 是否提取纯数字(如 "127支/件"→"127") |
 | `charTransform` | **★ 字符转换配置**（见下方 3.3.3 详解） |
+| `rowInherit` | **★ v1.2 行间继承配置**（见下方 3.3.4 详解） |
+
+##### extractNumber 数值提取说明
+
+当 `extractNumber = true` 时，从混合文本中提取第一个数值（含小数点）：
+
+```
+"127支/件"    →  "127"
+"12.5吨"      →  "12.5"
+"约5.0t"      →  "5.0"
+"3件(散)"     →  "3"
+```
+
+实现方式：使用正则 `(-?\d+\.?\d*)` 提取第一个匹配的数值字符串。与 `removeUnit` 的区别在于 `extractNumber` 更激进——只保留数字部分，而 `removeUnit` 是删除已知单位文字。当两者同时启用时，`extractNumber` 优先执行。
 
 #### 3.3.3 charTransform 字符转换子系统详解
 
@@ -562,17 +630,97 @@ HW200×200                    →  HW200*200       (×→*, 保留字母前缀)
     │   ├─ 2c. 合并去重, 按 sort_order 升序排列
     │   └─ 2d. 逐条执行: LITERAL→String.replace / REGEX→Pattern.replaceAll / ...
     │
-    ├─ Step 3: removeUnit (去单位, 如 "吨")
-    ├─ Step 4: regexExtract (正则提取)
-    ├─ Step 5: numericPrecision (数值精度处理)
-    └─ Step 6: parseAsRange (区间解析)
+    ├─ Step 3: extractNumber (数值提取, 如 "127支/件"→"127")    ← v1.2 新增
+    ├─ Step 4: removeUnit (去单位, 如 "吨")
+    ├─ Step 5: regexExtract (正则提取)
+    ├─ Step 6: numericPrecision (数值精度处理)
+    ├─ Step 7: parseAsRange (区间解析)
+    │
+    └─ Step 8: ★ rowInherit (行间继承, 如 "2.5"→"20*2.5")      ← v1.2 新增
+               (在 DataTransformer 之后, 由 RowInheritResolver 单独执行)
 
-输出 cleanValue
+输出 cleanValue → 进入 FieldValueMapper(品类/产地/材质映射)
 ```
 
 > **关键设计决策**：字符转换（Step 2）在去单位（Step 3）之前执行，因为去单位依赖于标准化后的字符（如全角"吨"需要先转为半角才能被 unitPatterns 匹配），同时在数值转换之前确保所有数字和分隔符已标准化。
 
-#### 3.3.3 match_fields 详解
+#### 3.3.4 rowInherit 行间继承配置详解 — v1.2 新增
+
+##### 业务场景
+
+钢塑管、镀锌管等品类的库存/价格表中，规格列经常存在"省略写法"：第一行写完整规格（如 `20*2.0`），后续行若仅写壁厚（如 `2.5`），表示公称口径不变，仅壁厚变化，实际规格应为 `20*2.5`。
+
+##### JSON 配置
+
+```json
+{
+    "enabled": true,
+    "separator": "*",
+    "partialPattern": "^[\\d.]+$",
+    "inheritPart": "PREFIX",
+    "assembleTemplate": "${prefix}*${current}"
+}
+```
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `enabled` | boolean | 是否启用行间继承 |
+| `separator` | string | 完整规格的分隔符（如 `*`），用于拆分前缀和后缀 |
+| `partialPattern` | string | 判断"仅部分值"的正则表达式，命中则认为需要继承 |
+| `inheritPart` | string | 继承方向：`PREFIX`(继承前缀)、`SUFFIX`(继承后缀) |
+| `assembleTemplate` | string | 组装模板：`${prefix}` 为继承部分，`${current}` 为当前行值 |
+
+##### 执行逻辑伪代码
+
+```java
+// RowInheritResolver 在 DataTransformer 之后执行
+// 维护一个 prevFullValue 状态(按字段缓存)
+
+String resolve(String currentValue, RowInheritConfig config) {
+    if (!config.isEnabled()) return currentValue;
+    if (currentValue == null || currentValue.isEmpty()) return currentValue;
+
+    boolean isPartial = Pattern.matches(config.getPartialPattern(), currentValue);
+
+    if (!isPartial) {
+        // 当前值是完整规格, 更新缓存的前缀
+        String[] parts = currentValue.split(Pattern.quote(config.getSeparator()), 2);
+        if (parts.length > 1) {
+            this.prevPrefix = parts[0]; // 缓存前缀, 如 "20"
+        }
+        return currentValue; // 原值返回
+    }
+
+    // 当前值是部分值(仅壁厚), 需要继承
+    if (this.prevPrefix == null) {
+        // 无上行前缀可继承, 记录警告
+        return currentValue;
+    }
+
+    // 用模板组装: "${prefix}*${current}" → "20*2.5"
+    return config.getAssembleTemplate()
+        .replace("${prefix}", this.prevPrefix)
+        .replace("${current}", currentValue);
+}
+```
+
+##### 多层规格的继承
+
+某些规格有三段（如 `50*100*2.0`），此时继承前缀为 `50*100`：
+
+```
+Excel 原始值        separator="*"   prefix缓存       继承后
+────────────────────────────────────────────────────────────
+50*100*2.0          完整             "50*100"         50*100*2.0
+2.5                 部分             (不变)           50*100*2.5
+1.8                 部分             (不变)           50*100*1.8
+60*120*3.0          完整             "60*120"         60*120*3.0
+2.0                 部分             (不变)           60*120*2.0
+```
+
+> 实现细节：拆分时使用 `split(separator, 2)` 只拆分最后一个分隔符之前的部分作为前缀。实际实现中应为 `lastIndexOf(separator)` 取前缀。
+
+#### 3.3.5 match_fields 详解
 
 ```json
 ["category", "spec", "origin", "material"]
@@ -628,7 +776,8 @@ com.eiss.erp.defineimport
 │   ├── FieldValueResolver.java                 // 字段值解析器(根据 source_type 取值)
 │   ├── DataTransformer.java                    // 数据转换器(清洗/格式化, 内部调用 CharTransformer)
 │   ├── CharTransformer.java                    // ★ 字符转换引擎(三级规则合并+有序管道执行)
-│   ├── CategoryMapper.java                     // 品类映射处理器
+│   ├── RowInheritResolver.java                 // ★ v1.2 行间继承解析器(规格前缀继承)
+│   ├── FieldValueMapper.java                   // ★ v1.2 通用字段值映射(品类/产地/材质, 原 CategoryMapper)
 │   ├── PriceMatcher.java                       // 价格→库存匹配器
 │   └── DataValidator.java                      // 数据校验器
 │
@@ -638,7 +787,7 @@ com.eiss.erp.defineimport
 │   │   ├── ImportTemplateSheet.java
 │   │   ├── ImportTemplateGroup.java
 │   │   ├── ImportTemplateField.java
-│   │   ├── ImportTemplateCategoryMapping.java
+│   │   ├── ImportTemplateFieldValueMapping.java // v1.2 泛化(原 CategoryMapping)
 │   │   ├── ImportTemplatePriceMatchRule.java
 │   │   ├── ImportCharRulePreset.java            // 系统预置字符转换规则
 │   │   ├── ImportTemplateCharRule.java          // 模板字符转换规则
@@ -650,7 +799,7 @@ com.eiss.erp.defineimport
 │   │   │   ├── SheetConfigDto.java
 │   │   │   ├── GroupConfigDto.java
 │   │   │   ├── FieldMappingDto.java
-│   │   │   └── CategoryMappingDto.java
+│   │   │   └── FieldValueMappingDto.java       // v1.2 泛化(原 CategoryMappingDto)
 │   │   │
 │   │   ├── preview/
 │   │   │   ├── ExcelFilePreviewDto.java        // Excel 文件预览(含全部 Sheet)
@@ -674,7 +823,8 @@ com.eiss.erp.defineimport
 │   │   ├── CompositeSourceConfig.java
 │   │   ├── ColumnHeaderSourceConfig.java
 │   │   ├── TransformConfig.java
-│   │   └── CharTransformConfig.java             // 字符转换配置(含 fieldRules, excludePresetCodes等)
+│   │   ├── CharTransformConfig.java             // 字符转换配置(含 fieldRules, excludePresetCodes等)
+│   │   └── RowInheritConfig.java                // v1.2 行间继承配置
 │   │
 │   └── enums/
 │       ├── ContentTypeEnum.java                // INVENTORY(1), PRICE(2)
@@ -688,7 +838,7 @@ com.eiss.erp.defineimport
 │   ├── ImportTemplateSheetMapper.java
 │   ├── ImportTemplateGroupMapper.java
 │   ├── ImportTemplateFieldMapper.java
-│   ├── ImportTemplateCategoryMappingMapper.java
+│   ├── ImportTemplateFieldValueMappingMapper.java  // v1.2 泛化
 │   ├── ImportTemplatePriceMatchRuleMapper.java
 │   ├── ImportCharRulePresetMapper.java          // 系统预置字符规则 Mapper
 │   ├── ImportTemplateCharRuleMapper.java        // 模板字符规则 Mapper
@@ -793,20 +943,67 @@ com.eiss.erp.defineimport
     - 若命中, 使用首格值
 ```
 
-#### CategoryMapper（品类映射处理器）
+#### FieldValueMapper（通用字段值映射处理器）★ v1.2 泛化（原 CategoryMapper）
 
 ```
-职责: 根据 CategoryMapping 规则, 将原始品类值转换为目标品类
+职责: 根据 FieldValueMapping 规则, 将原始字段值转换为目标值
+      支持品类(category)、产地(origin)、材质(material) 三个字段
 
-输入: rawCategory(原始品类) + qualifier(限定词, 可能来自表头)
-输出: targetCategory(目标品类)
+输入: targetField(目标字段编码) + rawValue(原始值) + qualifier(限定词)
+输出: mappedValue(映射后的值)
 
 算法:
-  1. 在 CategoryMapping 列表中查找:
-     (source_category = rawCategory OR source_category IS NULL)
+  1. 从 FieldValueMapping 列表中筛选 target_field 匹配的规则
+  2. 在筛选结果中查找:
+     (source_value = rawValue OR source_value IS NULL)
      AND (qualifier = inputQualifier OR qualifier IS NULL)
-  2. 若命中 → 返回 target_category
-  3. 若未命中 → 返回 rawCategory(原值透传)
+  3. 按 sort_order 取第一条命中的规则
+  4. 若命中 → 返回 target_value
+  5. 若未命中 → 返回 rawValue(原值透传)
+
+示例(品类):
+  规则: target_field=category, source_value="方管", qualifier="白材", target_value="镀锌方管"
+  输入: targetField=category, rawValue="方管", qualifier="白材"
+  输出: "镀锌方管"
+
+示例(产地):
+  规则: target_field=origin, source_value=null, qualifier="华岐", target_value="华岐"
+  输入: targetField=origin, rawValue=null, qualifier="华岐"
+  输出: "华岐"
+
+示例(材质):
+  规则: target_field=material, source_value=null, qualifier="Q235B", target_value="Q235B"
+  输入: targetField=material, rawValue=null, qualifier="Q235B"
+  输出: "Q235B"
+```
+
+#### RowInheritResolver（行间继承解析器）★ v1.2 新增
+
+```
+职责: 当规格列的当前行仅包含壁厚等部分值时, 继承上一行的前缀拼接为完整规格
+
+状态:
+  Map<String fieldCode, String prevPrefix> — 每个启用继承的字段独立维护前缀缓存
+
+输入: fieldCode + currentValue + RowInheritConfig
+输出: 完整的规格字符串
+
+算法:
+  1. 若 config 未启用 → 直接返回 currentValue
+  2. 判断 currentValue 是否为"部分值":
+     Pattern.matches(config.partialPattern, currentValue)
+  3. 若非部分值(完整规格):
+     a. 用 lastIndexOf(separator) 拆分, 取前缀部分
+     b. 更新 prevPrefix 缓存
+     c. 返回 currentValue(原值)
+  4. 若为部分值:
+     a. 取 prevPrefix 缓存
+     b. 若缓存为空 → 记录 WARNING, 返回原值
+     c. 按 assembleTemplate 组装: "${prefix}*${current}" → "20*2.5"
+
+性能:
+  - prevPrefix 是按行顺序维护的状态, 与 SAX 流式读取兼容
+  - 无额外内存开销, 仅保存一个字符串缓存
 ```
 
 #### PriceMatcher（价格→库存匹配器）
@@ -923,7 +1120,7 @@ com.eiss.erp.defineimport
                                  ▼
               ┌──────────────────────────────────────┐
               │       DataTransformer                │
-              │  (去空格/字符转换/去单位/数值/区间)     │
+              │  (去空格/字符转换/数值提取/去单位/...)  │
               │         ↓ 内部调用                    │
               │  ┌──────────────────────────────┐    │
               │  │     CharTransformer           │    │
@@ -934,8 +1131,17 @@ com.eiss.erp.defineimport
                                  │
                                  ▼
               ┌──────────────────────────────────────┐
-              │       CategoryMapper                 │
-              │  (品类映射: 方管+白材→镀锌方管)         │
+              │       RowInheritResolver ★v1.2       │
+              │  (规格行间继承: 20 + 2.5 → 20*2.5)    │
+              └──────────────────┬───────────────────┘
+                                 │
+                                 ▼
+              ┌──────────────────────────────────────┐
+              │       FieldValueMapper ★v1.2         │
+              │  (通用字段值映射:                      │
+              │   品类: 方管+白材→镀锌方管             │
+              │   产地: +华岐→华岐                    │
+              │   材质: +Q235B→Q235B)                 │
               └──────────────────┬───────────────────┘
                                  │
                                  ▼
@@ -1256,11 +1462,12 @@ com.eiss.erp.defineimport
                             }
                         }
                     ],
-                    "categoryMappings": [
+                    "fieldValueMappings": [
                         {
-                            "sourceCategory": "方管",
+                            "targetField": "category",
+                            "sourceValue": "方管",
                             "qualifier": "黑材",
-                            "targetCategory": "方管"
+                            "targetValue": "方管"
                         }
                     ]
                 },
@@ -1286,11 +1493,12 @@ com.eiss.erp.defineimport
                             }
                         }
                     ],
-                    "categoryMappings": [
+                    "fieldValueMappings": [
                         {
-                            "sourceCategory": "方管",
+                            "targetField": "category",
+                            "sourceValue": "方管",
                             "qualifier": "白材",
-                            "targetCategory": "镀锌方管"
+                            "targetValue": "镀锌方管"
                         }
                     ]
                 }
@@ -1411,7 +1619,8 @@ src/
 │   │   ├── CharRuleEditor.vue                // ★ 字符转换规则编辑器
 │   │   ├── CharRulePresetPicker.vue          // ★ 系统预置规则选择器
 │   │   ├── CharRuleTestPanel.vue             // ★ 字符转换规则测试面板
-│   │   ├── CategoryMappingEditor.vue         // 品类映射规则编辑
+│   │   ├── FieldValueMappingEditor.vue        // ★ v1.2 通用字段值映射编辑(品类/产地/材质)
+│   │   ├── RowInheritConfigForm.vue           // ★ v1.2 行间继承配置
 │   │   └── PriceMatchRuleForm.vue            // 价格匹配规则
 │   │
 │   └── import-result/
@@ -1476,8 +1685,18 @@ src/
 │  │                            │  │  │[测试] Φ219×6 → 219*6   │  │  │
 │  │                            │  │  └──────────────────────────┘  │  │
 │  │                            │  │                                │  │
-│  │                            │  │  品类映射规则 [+ 新增]          │  │
-│  │                            │  │  (当品类需要派生时配置)          │  │
+│  │                            │  │  字段值映射规则 ★v1.2           │  │
+│  │                            │  │  ┌──────────────────────────┐  │  │
+│  │                            │  │  │品类映射 [+新增]          │  │  │
+│  │                            │  │  │ 方管+白材→镀锌方管       │  │  │
+│  │                            │  │  │产地映射 [+新增]          │  │  │
+│  │                            │  │  │ +华岐→华岐              │  │  │
+│  │                            │  │  │材质映射 [+新增]          │  │  │
+│  │                            │  │  │ +Q235B唐山→Q235B        │  │  │
+│  │                            │  │  └──────────────────────────┘  │  │
+│  │                            │  │                                │  │
+│  │                            │  │  行间继承 ★v1.2                │  │
+│  │                            │  │  (规格字段: 2.5→20*2.5)        │  │
 │  │                            │  │                                │  │
 │  │                            │  │  价格匹配规则                   │  │
 │  │                            │  │  (仅价格类型Sheet显示)          │  │
@@ -1511,17 +1730,50 @@ src/
 6. 点击「确认」→ 字段映射保存, 左侧对应列/单元格高亮标记
 ```
 
-#### 品类映射配置交互
+#### 字段值映射配置交互（v1.2 泛化）
 
 ```
-1. 用户在品类字段选择 COMPOSITE 或 COLUMN_HEADER 类型
-2. 展开「品类映射规则」区域
-3. 点击 [+ 新增映射]:
-   - 原始品类: [方管]  (来自品类列的值)
-   - 限定词:   [白材]  (来自表头或指定单元格的值)
-   - 目标品类: [镀锌方管]  (系统中的标准品类名)
-4. 可添加多条映射规则
-5. 预览: 根据当前 Excel 数据实时展示映射结果
+1. 展开「字段值映射规则」折叠区域
+2. 三个子页签: [品类映射] [产地映射] [材质映射]
+3. 以品类映射为例, 点击 [+ 新增映射]:
+   - 原始值:   [方管]     (来自品类列的值, 可留空表示匹配任意)
+   - 限定词:   [白材]     (来自表头或指定单元格的值)
+   - 目标值:   [镀锌方管]  (映射后的标准名称)
+4. 产地映射示例:
+   - 原始值:   (空)
+   - 限定词:   [华岐]     (表头文字)
+   - 目标值:   [华岐]     (标准产地名)
+5. 材质映射示例:
+   - 原始值:   (空)
+   - 限定词:   [Q235B唐山] (表头文字, 同时含材质和产地)
+   - 目标值:   [Q235B]    (标准材质名)
+6. 可添加多条映射规则, 按优先级排序
+7. 预览: 根据当前 Excel 数据实时展示映射结果
+
+注: 产地和材质的映射规则与品类完全一致, 区别仅在于 target_field 字段
+```
+
+#### 行间继承配置交互 ★ v1.2 新增
+
+```
+1. 在规格字段的映射编辑中, 展开「数据转换 → 行间继承」
+2. ☑ 启用行间继承
+3. 配置项:
+   - 分隔符:     [*]        (用于拆分规格的前缀和后缀)
+   - 部分值检测:  [^\d.]+$]  (正则: 纯数字即为部分值)
+   - 继承方向:    [前缀]     (PREFIX: 继承前缀; SUFFIX: 继承后缀)
+   - 组装模板:    [${prefix}*${current}]
+4. 实时预览:
+   从当前 Sheet 规格列取数据, 展示继承效果:
+   ┌──────────────┬──────────────┐
+   │ Excel 原始值  │ 继承后        │
+   ├──────────────┼──────────────┤
+   │ 20*2.0       │ 20*2.0       │
+   │ 2.5          │ 20*2.5 ←继承 │
+   │ 3.0          │ 20*3.0 ←继承 │
+   │ 25*2.0       │ 25*2.0       │
+   │ 2.5          │ 25*2.5 ←继承 │
+   └──────────────┴──────────────┘
 ```
 
 #### 字符转换规则配置交互 ★ v1.1 新增
@@ -1654,14 +1906,26 @@ public class DynamicExcelListener extends AnalysisEventListener<Map<Integer, Cel
                 field, rowData, headerColumnMap, mergeCellMap, fixedCellCache, rowIndex
             );
 
-            // 数据转换(内含字符转换管道: 系统预置→模板级→字段级规则按序执行)
+            // 数据转换(内含字符转换管道+数值提取: 系统预置→模板级→字段级规则按序执行)
             String cleanValue = DataTransformer.transform(rawValue, field.getTransformConfig(),
                 charTransformPipelineCache.get(field.getFieldCode()));
 
-            // 品类映射
-            if ("category".equals(field.getFieldCode()) && group.getCategoryMappings() != null) {
-                String qualifier = resolveQualifier(group, rowData);
-                cleanValue = CategoryMapper.map(cleanValue, qualifier, group.getCategoryMappings());
+            // 行间继承(规格字段: 当前行仅壁厚时继承上行前缀)
+            if (field.getTransformConfig() != null && field.getTransformConfig().getRowInherit() != null) {
+                cleanValue = rowInheritResolver.resolve(field.getFieldCode(), cleanValue,
+                    field.getTransformConfig().getRowInherit());
+            }
+
+            // 通用字段值映射(品类/产地/材质, v1.2 从 CategoryMapper 泛化)
+            if (isValueMappableField(field.getFieldCode()) && group.getFieldValueMappings() != null) {
+                String qualifier = resolveQualifier(group, rowData, field.getFieldCode());
+                cleanValue = FieldValueMapper.map(field.getFieldCode(), cleanValue,
+                    qualifier, group.getFieldValueMappings());
+            }
+
+            // 组级固定值回退: 若字段值仍为空且组上定义了固定值, 使用固定值
+            if (StringUtils.isBlank(cleanValue)) {
+                cleanValue = group.getFixedValueForField(field.getFieldCode());
             }
 
             // 安全赋值(含类型转换异常处理)
@@ -1877,6 +2141,182 @@ public class ExcelImportError {
 
 **解析结果**: 6 行库存数据，规格全部归一化为标准格式。
 
+### 场景 6：库存冷水/热水分组（钢塑管）★ v1.2 新增
+
+**Excel 原始数据**（钢塑管库存，同一 Sheet 内两个区域）:
+```
+Row 1: | 品名     | 规格   | 件数  | 重量  |
+Row 2: | 冷水钢塑管 |        |       |       |    ← 合并单元格标题行
+Row 3: |          | 20*2.0 | 10    | 5.2   |
+Row 4: |          | 25*2.5 | 8     | 4.8   |
+Row 5: |          | 32*3.0 | 6     | 6.0   |
+Row 6: | 热水钢塑管 |        |       |       |    ← 合并单元格标题行
+Row 7: |          | 20*2.8 | 12    | 6.5   |
+Row 8: |          | 25*3.5 | 9     | 5.2   |
+```
+
+**模板配置要点**:
+- Sheet: contentType=1(库存), enableMergeCell=true
+- **Group 1**（冷水）:
+  - groupName="冷水钢塑管", fixed_category="冷水钢塑管"
+  - data_start_row=2, data_end_row=4（组级行范围）
+  - spec→COLUMN(col=1), package_num→COLUMN(col=2), weight→COLUMN(col=3)
+- **Group 2**（热水）:
+  - groupName="热水钢塑管", fixed_category="热水钢塑管"
+  - data_start_row=6, data_end_row=7
+  - 字段映射与 Group 1 相同
+
+**解析结果**: 5 行库存记录，品类分别为"冷水钢塑管"(3行)和"热水钢塑管"(2行)。
+
+### 场景 7：包装数量文本提取 ★ v1.2 新增
+
+**Excel 原始数据**:
+```
+| 品类 | 规格   | 包装形式   | 件数 | 重量  |
+|------|--------|----------|------|-------|
+| 槽钢 | 10#    | 127支/件  | 5    | 12.5  |
+| 角钢 | 50*5   | 42支/件   | 8    | 9.2   |
+| 工字钢| 20#    | 约30支    | 6    | 15.0  |
+```
+
+**模板配置要点**:
+- package_num 字段的 transformConfig:
+```json
+{
+    "extractNumber": true,
+    "trimWhitespace": true
+}
+```
+
+**转换过程**:
+```
+"127支/件"  → extractNumber → "127"
+"42支/件"   → extractNumber → "42"
+"约30支"    → extractNumber → "30"
+```
+
+### 场景 8：规格行间继承 ★ v1.2 新增
+
+**Excel 原始数据**（钢塑管价格表）:
+```
+| 规格   | 壁厚  | 单价  |
+|--------|------|-------|
+| 20*2.0 |      | 4200  |    ← 完整规格
+| 2.5    |      | 4300  |    ← 仅壁厚, 实际为 20*2.5
+| 3.0    |      | 4400  |    ← 仅壁厚, 实际为 20*3.0
+| 25*2.0 |      | 4500  |    ← 新的完整规格
+| 2.5    |      | 4600  |    ← 实际为 25*2.5
+```
+
+**模板配置要点**:
+- spec 字段的 transformConfig:
+```json
+{
+    "trimWhitespace": true,
+    "charTransform": { "usePresetGroups": ["SPEC", "COMMON"] },
+    "rowInherit": {
+        "enabled": true,
+        "separator": "*",
+        "partialPattern": "^[\\d.]+$",
+        "inheritPart": "PREFIX",
+        "assembleTemplate": "${prefix}*${current}"
+    }
+}
+```
+
+**继承过程**:
+```
+原始值    partialPattern命中?   prevPrefix缓存   继承后
+────────────────────────────────────────────────────
+20*2.0    否(含*)              "20"             20*2.0
+2.5       是(纯数字)           (不变)           20*2.5
+3.0       是                   (不变)           20*3.0
+25*2.0    否                   "25"             25*2.0
+2.5       是                   (不变)           25*2.5
+```
+
+**解析结果**: 5 条价格记录，规格完整归一化。
+
+### 场景 9：一行多品类多产地价格表 ★ v1.2 新增
+
+**Excel 原始数据**:
+```
+| A(规格) | B(壁厚)   | C(焊管)  | D(华岐)  | E(中天)  |
+|---------|----------|---------|---------|---------|
+| 4分     | 1.0-4.0  | 5000    | 5500    | 5510    |
+| 6分     | 1.0-4.0  | 5200    | 5700    | 5710    |
+| 1寸     | 2.0-5.0  | 5500    | 6000    | 6010    |
+```
+
+> **业务含义**: "焊管"是一个品类(如 焊管)，"华岐"是品类"镀锌管"+产地"华岐"，"中天"是品类"镀锌管"+产地"中天"。
+
+**模板配置要点**:
+- Sheet: contentType=2(价格), headerRowIndex=0
+- **Group 1**（焊管）:
+  - groupSeq=1, groupName="焊管价格"
+  - fixed_category="焊管"
+  - fields:
+    - spec→COLUMN(col=0), wall_thickness→COLUMN(col=1), price→COLUMN(col=2)
+- **Group 2**（华岐镀锌管）:
+  - groupSeq=2, groupName="华岐镀锌管价格"
+  - fixed_category="镀锌管", fixed_origin="华岐"
+  - fields:
+    - spec→COLUMN(col=0), wall_thickness→COLUMN(col=1), price→COLUMN(col=3)
+- **Group 3**（中天镀锌管）:
+  - groupSeq=3, groupName="中天镀锌管价格"
+  - fixed_category="镀锌管", fixed_origin="中天"
+  - fields:
+    - spec→COLUMN(col=0), wall_thickness→COLUMN(col=1), price→COLUMN(col=4)
+
+**解析结果**: 3行 × 3组 = 9 条价格记录:
+
+```
+品类      规格   壁厚范围   产地    价格
+─────────────────────────────────────────
+焊管      4分    1.0-4.0   (空)    5000
+焊管      6分    1.0-4.0   (空)    5200
+焊管      1寸    2.0-5.0   (空)    5500
+镀锌管    4分    1.0-4.0   华岐    5500
+镀锌管    6分    1.0-4.0   华岐    5700
+镀锌管    1寸    2.0-5.0   华岐    6000
+镀锌管    4分    1.0-4.0   中天    5510
+镀锌管    6分    1.0-4.0   中天    5710
+镀锌管    1寸    2.0-5.0   中天    6010
+```
+
+### 场景 10：产地/材质表头派生 + 字段值映射 ★ v1.2 新增
+
+**Excel 原始数据**（价格表，表头含产地和材质信息）:
+```
+| A(品类) | B(规格) | C(Q235B唐山) | D(Q235B邯郸) | E(Q355B唐山) |
+|---------|---------|-------------|-------------|-------------|
+| 槽钢    | 10#     | 4200        | 4150        | 4800        |
+| 槽钢    | 12#     | 4300        | 4250        | 4900        |
+```
+
+> **业务含义**: 表头 "Q235B唐山" 同时包含材质(Q235B)和产地(唐山)信息。
+
+**模板配置要点**:
+- **Group 1** (Q235B唐山):
+  - fields: category→COLUMN(0), spec→COLUMN(1), price→COLUMN(2)
+  - fieldValueMappings:
+    - { targetField:"material", sourceValue:null, qualifier:"Q235B唐山", targetValue:"Q235B" }
+    - { targetField:"origin", sourceValue:null, qualifier:"Q235B唐山", targetValue:"唐山" }
+
+- **Group 2** (Q235B邯郸):
+  - fields: category→COLUMN(0), spec→COLUMN(1), price→COLUMN(3)
+  - fieldValueMappings:
+    - { targetField:"material", sourceValue:null, qualifier:"Q235B邯郸", targetValue:"Q235B" }
+    - { targetField:"origin", sourceValue:null, qualifier:"Q235B邯郸", targetValue:"邯郸" }
+
+- **Group 3** (Q355B唐山):
+  - fields: category→COLUMN(0), spec→COLUMN(1), price→COLUMN(4)
+  - fieldValueMappings:
+    - { targetField:"material", sourceValue:null, qualifier:"Q355B唐山", targetValue:"Q355B" }
+    - { targetField:"origin", sourceValue:null, qualifier:"Q355B唐山", targetValue:"唐山" }
+
+**解析结果**: 2行 × 3组 = 6 条价格记录，每条都有独立的品类+规格+产地+材质+价格。
+
 ---
 
 ## 十二、安全与健壮性设计
@@ -1940,7 +2380,8 @@ public class SafeConvertUtil {
 | `DataTransformerTest` | 去空格、去单位、数值精度、区间解析、字符转换管道集成 |
 | `CharTransformerTest` | ★ 三级规则合并、sort_order排序、四种matchType、excludePresetCodes、pipeline缓存、正则异常容错、全角转半角批量、空pipeline快速路径 |
 | `CharRulePresetTest` | ★ 系统预置规则覆盖率: 所有INSERT初始数据的正确性验证 |
-| `CategoryMapperTest` | 品类映射命中/未命中/通配 |
+| `FieldValueMapperTest` | 品类/产地/材质映射命中/未命中/通配/多字段联合 |
+| `RowInheritResolverTest` | 完整规格/部分值/连续部分值/前缀切换/空值/首行即部分值 |
 | `PriceMatcherTest` | 精确匹配、壁厚区间匹配 |
 | `MergeCellCollectorTest` | 合并区域填充、边界条件 |
 | `SafeConvertUtilTest` | 各种异常字符串的安全转换 |
