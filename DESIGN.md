@@ -8,6 +8,7 @@
 > v1.4 变更：完成 6 项扩展方向的完整设计  
 > v1.5 变更：万人并发导入架构设计  
 > v1.6 变更：新增「库存与价格分批导入 + 跨批次价格回写」——支持先导库存后导价格，价格自动回写已入库库存  
+> v1.7 变更：备注(remark)字段升级为规则驱动——支持固定值/固定单元格/表头派生/字段值映射/组级固定，与产地/材质同等规则能力  
 
 ---
 
@@ -61,7 +62,7 @@
 │  │   │                                                               │
 │  │   ├── DataGroup (数据组) ×M                                       │
 │  │   │   ┌─ group_seq, group_name                                   │
-│  │   │   │  fixed_category / fixed_origin / fixed_material          │
+│  │   │   │  fixed_category / fixed_origin / fixed_material / fixed_remark │
 │  │   │   │                                                           │
 │  │   │   ├── FieldMapping (字段映射) ×K                              │
 │  │   │   │   ┌─ field_code(品类/规格/产地/...)                       │
@@ -71,10 +72,11 @@
 │  │   │   │   └─ inherit_config(JSON, 规格行间继承)                   │
 │  │   │   │                                                           │
 │  │   │   └── FieldValueMapping (字段值映射) ×L    ← v1.2 泛化        │
-│  │   │       ┌─ target_field(category/origin/material)              │
+│  │   │       ┌─ target_field(category/origin/material/remark) ←v1.7 │
 │  │   │       │  source_value + qualifier → target_value             │
 │  │   │       └─ 如: "方管"+"白材" → "镀锌方管"                       │
 │  │   │           "焊管"(表头) → 产地:"焊管厂"                        │
+│  │   │           null+"冷水" → 备注:"冷水管"                          │
 │  │   │                                                               │
 │  │   └── PriceMatchRule (价格匹配规则)                                │
 │  │       ┌─ match_fields, wall_thickness_range                       │
@@ -96,8 +98,8 @@
 
 每个数据组可拥有独立的字段映射规则，也可共享 Sheet 级别的公共映射（`group_id=null` 的字段适用于所有组）。
 
-**数据组的关键属性（v1.2 增强）**：
-- 每个组可直接指定 `fixed_category`、`fixed_origin`、`fixed_material`（组级固定值，无需再定义字段映射）
+**数据组的关键属性（v1.2 增强, v1.7 扩展）**：
+- 每个组可直接指定 `fixed_category`、`fixed_origin`、`fixed_material`、`fixed_remark`（组级固定值，无需再定义字段映射）
 - 组的字段映射优先于组级固定值（字段映射存在时覆盖固定值）
 
 #### 字段数据来源类型 (SourceType)
@@ -114,7 +116,7 @@
 
 > v1.1 中此功能仅支持品类(CategoryMapping)，v1.2 泛化为**通用字段值映射**，支持品类、产地、材质三个字段。
 
-当品类/产地/材质需要根据 **限定词(qualifier)** 派生时使用：
+当品类/产地/材质/备注需要根据 **限定词(qualifier)** 派生时使用：
 
 ```
 目标字段   原始值(列值/表头)    + 限定词(如表头文字)    → 目标值
@@ -126,6 +128,9 @@ category  null                + "华岐"(表头)          → "镀锌管"
 origin    null                + "华岐"(表头)          → "华岐"
 origin    "津西"              + null                  → "天津津西"
 material  null                + "Q235B"(表头)         → "Q235B"
+remark    null                + "冷水"(表头/单元格)    → "冷水管"         ← v1.7
+remark    null                + "国标"(表头)          → "国标件"          ← v1.7
+remark    "过磅"              + null                  → "过磅结算"        ← v1.7
 ```
 
 #### 库存与价格分批导入 (CrossBatchPriceWriteback) — v1.6 新增
@@ -260,6 +265,7 @@ CREATE TABLE `import_template_group` (
     `fixed_category`    VARCHAR(128)    DEFAULT NULL             COMMENT '组级固定品类(如"焊管"、"镀锌管"), 字段映射存在时被覆盖',
     `fixed_origin`      VARCHAR(128)    DEFAULT NULL             COMMENT '组级固定产地(如"华岐"、"中天")',
     `fixed_material`    VARCHAR(128)    DEFAULT NULL             COMMENT '组级固定材质(如"Q235B")',
+    `fixed_remark`      VARCHAR(512)    DEFAULT NULL             COMMENT 'v1.7 组级固定备注(如"冷水管"、"国标件")',
     `data_start_row`    INT             DEFAULT NULL             COMMENT '组数据起始行(null=使用Sheet级配置)',
     `data_end_row`      INT             DEFAULT NULL             COMMENT '组数据结束行(null=使用Sheet级配置)',
     `remark`            VARCHAR(256)    DEFAULT NULL             COMMENT '备注',
@@ -305,7 +311,7 @@ CREATE TABLE `import_template_field_value_mapping` (
     `template_id`       BIGINT          NOT NULL                 COMMENT '模板ID',
     `sheet_config_id`   BIGINT          NOT NULL                 COMMENT 'Sheet配置ID',
     `group_id`          BIGINT          DEFAULT NULL             COMMENT '数据组ID',
-    `target_field`      VARCHAR(64)     NOT NULL                 COMMENT '目标字段编码: category/origin/material',
+    `target_field`      VARCHAR(64)     NOT NULL                 COMMENT '目标字段编码: category/origin/material/remark',
     `source_value`      VARCHAR(128)    DEFAULT NULL             COMMENT '原始值(null表示匹配任意)',
     `qualifier`         VARCHAR(128)    DEFAULT NULL             COMMENT '限定词(如表头文字: 黑材/白材/华岐)',
     `target_value`      VARCHAR(128)    NOT NULL                 COMMENT '目标值(映射后的值)',
@@ -721,7 +727,7 @@ HW200×200                    →  HW200*200       (×→*, 保留字母前缀)
     └─ Step 8: ★ rowInherit (行间继承, 如 "2.5"→"20*2.5")      ← v1.2 新增
                (在 DataTransformer 之后, 由 RowInheritResolver 单独执行)
 
-输出 cleanValue → 进入 FieldValueMapper(品类/产地/材质映射)
+输出 cleanValue → 进入 FieldValueMapper(品类/产地/材质/备注映射)
 ```
 
 > **关键设计决策**：字符转换（Step 2）在去单位（Step 3）之前执行，因为去单位依赖于标准化后的字符（如全角"吨"需要先转为半角才能被 unitPatterns 匹配），同时在数值转换之前确保所有数字和分隔符已标准化。
@@ -998,7 +1004,7 @@ com.eiss.erp.defineimport
 │   ├── DataTransformer.java                    // 数据转换器(清洗/格式化, 内部调用 CharTransformer)
 │   ├── CharTransformer.java                    // ★ 字符转换引擎(三级规则合并+有序管道执行)
 │   ├── RowInheritResolver.java                 // ★ v1.2 行间继承解析器(规格前缀继承)
-│   ├── FieldValueMapper.java                   // ★ v1.2 通用字段值映射(品类/产地/材质, 原 CategoryMapper)
+│   ├── FieldValueMapper.java                   // ★ v1.2 通用字段值映射(品类/产地/材质/备注, v1.7 扩展 remark)
 │   ├── SpecRangeParser.java                    // ★ v1.3 规格区间后缀解析器(拆分基础规格+区间)
 │   ├── PriceMatcher.java                       // 价格→库存匹配器(v1.3 增强: 支持规格区间匹配)
 │   ├── PriceWritebackExecutor.java             // ★ v1.6 跨批次价格回写执行器
@@ -1186,11 +1192,11 @@ com.eiss.erp.defineimport
     - 若命中, 使用首格值
 ```
 
-#### FieldValueMapper（通用字段值映射处理器）★ v1.2 泛化（原 CategoryMapper）
+#### FieldValueMapper（通用字段值映射处理器）★ v1.2 泛化（原 CategoryMapper）★ v1.7 扩展支持 remark
 
 ```
 职责: 根据 FieldValueMapping 规则, 将原始字段值转换为目标值
-      支持品类(category)、产地(origin)、材质(material) 三个字段
+      支持品类(category)、产地(origin)、材质(material)、备注(remark) 四个字段
 
 输入: targetField(目标字段编码) + rawValue(原始值) + qualifier(限定词)
 输出: mappedValue(映射后的值)
@@ -1218,6 +1224,15 @@ com.eiss.erp.defineimport
   规则: target_field=material, source_value=null, qualifier="Q235B", target_value="Q235B"
   输入: targetField=material, rawValue=null, qualifier="Q235B"
   输出: "Q235B"
+
+示例(备注) ★v1.7:
+  规则: target_field=remark, source_value=null, qualifier="冷水", target_value="冷水管"
+  输入: targetField=remark, rawValue=null, qualifier="冷水"
+  输出: "冷水管"
+
+  规则: target_field=remark, source_value="过磅", qualifier=null, target_value="过磅结算"
+  输入: targetField=remark, rawValue="过磅", qualifier=null
+  输出: "过磅结算"
 ```
 
 #### RowInheritResolver（行间继承解析器）★ v1.2 新增
@@ -1537,11 +1552,12 @@ com.eiss.erp.defineimport
                                  │
                                  ▼
               ┌──────────────────────────────────────┐
-              │       FieldValueMapper ★v1.2         │
+              │       FieldValueMapper ★v1.2/v1.7    │
               │  (通用字段值映射:                      │
               │   品类: 方管+白材→镀锌方管             │
               │   产地: +华岐→华岐                    │
-              │   材质: +Q235B→Q235B)                 │
+              │   材质: +Q235B→Q235B                  │
+              │   备注: +冷水→冷水管) ★v1.7           │
               └──────────────────┬───────────────────┘
                                  │
                                  ▼
@@ -2121,7 +2137,7 @@ src/
 │   │   ├── CharRuleEditor.vue                // ★ 字符转换规则编辑器
 │   │   ├── CharRulePresetPicker.vue          // ★ 系统预置规则选择器
 │   │   ├── CharRuleTestPanel.vue             // ★ 字符转换规则测试面板
-│   │   ├── FieldValueMappingEditor.vue        // ★ v1.2 通用字段值映射编辑(品类/产地/材质)
+│   │   ├── FieldValueMappingEditor.vue        // ★ v1.2 通用字段值映射编辑(品类/产地/材质/备注)
 │   │   ├── RowInheritConfigForm.vue           // ★ v1.2 行间继承配置
 │   │   ├── SpecRangeConfigForm.vue           // ★ v1.3 规格区间后缀匹配配置
 │   │   └── PriceMatchRuleForm.vue            // 价格匹配规则(v1.3 增强: 区间匹配策略选择)
@@ -2195,7 +2211,7 @@ src/
 │  │                            │  │  │[测试] Φ219×6 → 219*6   │  │  │
 │  │                            │  │  └──────────────────────────┘  │  │
 │  │                            │  │                                │  │
-│  │                            │  │  字段值映射规则 ★v1.2           │  │
+│  │                            │  │  字段值映射规则 ★v1.2/v1.7      │  │
 │  │                            │  │  ┌──────────────────────────┐  │  │
 │  │                            │  │  │品类映射 [+新增]          │  │  │
 │  │                            │  │  │ 方管+白材→镀锌方管       │  │  │
@@ -2203,6 +2219,8 @@ src/
 │  │                            │  │  │ +华岐→华岐              │  │  │
 │  │                            │  │  │材质映射 [+新增]          │  │  │
 │  │                            │  │  │ +Q235B唐山→Q235B        │  │  │
+│  │                            │  │  │备注映射 [+新增] ★v1.7   │  │  │
+│  │                            │  │  │ +冷水→冷水管             │  │  │
 │  │                            │  │  └──────────────────────────┘  │  │
 │  │                            │  │                                │  │
 │  │                            │  │  行间继承 ★v1.2                │  │
@@ -2244,7 +2262,7 @@ src/
 
 ```
 1. 展开「字段值映射规则」折叠区域
-2. 三个子页签: [品类映射] [产地映射] [材质映射]
+2. 四个子页签: [品类映射] [产地映射] [材质映射] [备注映射]    ← v1.7 新增备注页签
 3. 以品类映射为例, 点击 [+ 新增映射]:
    - 原始值:   [方管]     (来自品类列的值, 可留空表示匹配任意)
    - 限定词:   [白材]     (来自表头或指定单元格的值)
@@ -2257,7 +2275,15 @@ src/
    - 原始值:   (空)
    - 限定词:   [Q235B唐山] (表头文字, 同时含材质和产地)
    - 目标值:   [Q235B]    (标准材质名)
-6. 可添加多条映射规则, 按优先级排序
+6. 备注映射示例 ★v1.7:
+   - 原始值:   (空)
+   - 限定词:   [冷水]      (来自表头区域或固定单元格)
+   - 目标值:   [冷水管]    (标准化备注)
+   另一种:
+   - 原始值:   [过磅]      (来自备注列的原始值)
+   - 限定词:   (空)
+   - 目标值:   [过磅结算]  (标准化备注)
+7. 可添加多条映射规则, 按优先级排序
 7. 预览: 根据当前 Excel 数据实时展示映射结果
 
 注: 产地和材质的映射规则与品类完全一致, 区别仅在于 target_field 字段
@@ -2426,7 +2452,7 @@ public class DynamicExcelListener extends AnalysisEventListener<Map<Integer, Cel
                     field.getTransformConfig().getRowInherit());
             }
 
-            // 通用字段值映射(品类/产地/材质, v1.2 从 CategoryMapper 泛化)
+            // 通用字段值映射(品类/产地/材质/备注, v1.2泛化 v1.7扩展remark)
             if (isValueMappableField(field.getFieldCode()) && group.getFieldValueMappings() != null) {
                 String qualifier = resolveQualifier(group, rowData, field.getFieldCode());
                 cleanValue = FieldValueMapper.map(field.getFieldCode(), cleanValue,
@@ -3587,7 +3613,7 @@ public class SafeConvertUtil {
 | `DataTransformerTest` | 去空格、去单位、数值精度、区间解析、字符转换管道集成 |
 | `CharTransformerTest` | ★ 三级规则合并、sort_order排序、四种matchType、excludePresetCodes、pipeline缓存、正则异常容错、全角转半角批量、空pipeline快速路径 |
 | `CharRulePresetTest` | ★ 系统预置规则覆盖率: 所有INSERT初始数据的正确性验证 |
-| `FieldValueMapperTest` | 品类/产地/材质映射命中/未命中/通配/多字段联合 |
+| `FieldValueMapperTest` | 品类/产地/材质/备注映射命中/未命中/通配/多字段联合/备注派生 |
 | `RowInheritResolverTest` | 完整规格/部分值/连续部分值/前缀切换/空值/首行即部分值 |
 | `SpecRangeParserTest` | ★ v1.3 括号解析、各种区间表达(以上/以下/+/∞/数字-数字)、无区间规格、全半角括号混用、解析失败容错 |
 | `PriceMatcherTest` | 精确匹配、壁厚区间匹配、★ v1.3 规格区间匹配(四种策略)、库存无区间回退、base规格不等短路 |
