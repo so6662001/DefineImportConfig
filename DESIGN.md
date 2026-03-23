@@ -1,9 +1,10 @@
 # 钢贸动态 Excel 导入系统 — 详细设计文档
 
-> 版本：v1.2  
+> 版本：v1.3  
 > 技术栈：Java 17 + Spring Boot + Alibaba EasyExcel + MyBatis-Plus + MySQL + Vue 3  
 > v1.1 变更：新增「规格特殊符号转换」子系统设计  
-> v1.2 变更：① 品类映射泛化为通用字段值映射（支持品类/产地/材质）② 新增规格行间继承机制 ③ 增强数值提取能力 ④ 完善一行多品类多产地价格分组 ⑤ 新增场景 6-10  
+> v1.2 变更：① 品类映射泛化为通用字段值映射 ② 行间继承 ③ 数值提取 ④ 多品类价格分组 ⑤ 场景 6-10  
+> v1.3 变更：新增「规格附带区间后缀解析与匹配」——支持 `5#（10-15）` vs `5#(10以上)` 的基础规格拆分与区间包含匹配  
 
 ---
 
@@ -29,6 +30,7 @@
 | 包装数量混合文本 | 包装形式写为"127支/件"，需提取纯数字 127 |
 | 产地/材质灵活 | 产地和材质也存在类似品类的映射规则，如表头限定词派生、固定单元格指定等 |
 | 一行多品类价格 | 同一行存在多个品类的价格列（如"焊管"列 + "华岐(镀锌管)"列 + "中天(镀锌管)"列），每列是独立品类+产地的价格 |
+| 规格附带区间后缀 | 镀锌型材等品类的规格后附带重量/数量区间，如库存 `5#（10-15）`、价格 `5#(10以上)`，匹配时需拆分基础规格与区间后缀做包含判断 |
 | 库存冷热水分组 | 钢塑管等品类中"冷水"和"热水"是两个品类，同一 Sheet 需按区域分组读取 |
 
 ### 1.2 核心目标
@@ -291,6 +293,8 @@ CREATE TABLE `import_template_price_match_rule` (
     `sheet_config_id`           BIGINT          DEFAULT NULL             COMMENT 'Sheet配置ID(null=模板级规则)',
     `match_fields`              JSON            NOT NULL                 COMMENT '参与匹配的字段列表 如["category","spec","origin","material"]',
     `wall_thickness_match_mode` TINYINT         NOT NULL DEFAULT 0       COMMENT '壁厚匹配模式 0-精确匹配 1-区间匹配',
+    `spec_range_match_mode`     TINYINT         NOT NULL DEFAULT 0       COMMENT 'v1.3 规格区间后缀匹配模式 0-不处理(整体精确) 1-拆分基础规格+区间包含匹配',
+    `spec_range_config`         JSON            DEFAULT NULL             COMMENT 'v1.3 规格区间解析配置(JSON)',
     `remark`                    VARCHAR(256)    DEFAULT NULL,
     `create_time`               DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
     `update_time`               DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -726,7 +730,146 @@ Excel 原始值        separator="*"   prefix缓存       继承后
 ["category", "spec", "origin", "material"]
 ```
 
-指定价格匹配库存时参与比对的业务字段。壁厚区间匹配由 `wall_thickness_match_mode` 单独控制。
+指定价格匹配库存时参与比对的业务字段。壁厚区间匹配由 `wall_thickness_match_mode` 单独控制，规格区间后缀匹配由 `spec_range_match_mode` 单独控制。
+
+#### 3.3.6 spec_range_config 规格区间后缀配置详解 — v1.3 新增
+
+##### 业务场景
+
+镀锌型材等品类的规格中，基础型号后面会附带一个用括号包裹的重量/数量区间后缀：
+
+```
+库存规格               解析为
+──────────────────────────────────────────
+5#（10-15）            基础规格="5#", 区间=[10, 15]
+5#(10-15)              基础规格="5#", 区间=[10, 15]
+10#（5-10）             基础规格="10#", 区间=[5, 10]
+10#(20以上)             基础规格="10#", 区间=[20, +∞)
+10#(20+)               基础规格="10#", 区间=[20, +∞)
+10#(20-∞)              基础规格="10#", 区间=[20, +∞)
+10#(∞)                 基础规格="10#", 区间=[0, +∞)
+10#(20以下)             基础规格="10#", 区间=[0, 20]
+5#                     基础规格="5#", 区间=null(无区间)
+50*100*2.0             基础规格="50*100*2.0", 区间=null
+```
+
+价格表中可能使用不同的区间表达方式。匹配时需判断库存的区间是否被价格的区间**包含**（价格区间覆盖了库存区间）或**重叠**。
+
+##### JSON 配置
+
+```json
+{
+    "rangePattern": "[（(]([^）)]+)[）)]\\s*$",
+    "rangeSeparators": ["-", "~", "—", "－"],
+    "infinityKeywords": ["以上", "+", "∞", "以上(含)", "及以上", "↑"],
+    "zeroKeywords": ["以下", "以内", "以下(含)", "及以下", "↓"],
+    "matchStrategy": "PRICE_CONTAINS_INVENTORY"
+}
+```
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `rangePattern` | string | 从规格字符串末尾提取区间后缀的正则表达式。捕获组1为括号内文本 |
+| `rangeSeparators` | string[] | 区间分隔符列表，用于将 `"10-15"` 拆分为 min=10, max=15 |
+| `infinityKeywords` | string[] | 正无穷关键词，如 `"以上"` → max=+∞ |
+| `zeroKeywords` | string[] | 下界关键词，如 `"以下"` → min=0 |
+| `matchStrategy` | string | 匹配策略（见下方详解） |
+
+##### 匹配策略 (matchStrategy)
+
+| 策略 | 说明 | 匹配条件 |
+|------|------|---------|
+| `PRICE_CONTAINS_INVENTORY` | 价格区间完全包含库存区间 | price.min ≤ inv.min AND inv.max ≤ price.max |
+| `RANGE_OVERLAP` | 两区间存在交集 | price.min ≤ inv.max AND inv.min ≤ price.max |
+| `INVENTORY_MIN_IN_PRICE` | 库存下界落在价格区间内 | price.min ≤ inv.min ≤ price.max |
+| `BASE_SPEC_ONLY` | 仅匹配基础规格，忽略区间 | baseSpec 相等即可 |
+
+##### 区间解析算法 (SpecRangeParser)
+
+```
+输入: rangeText = 括号内文本(已去除括号)
+输出: Range(min, max)
+
+算法:
+  1. trim(rangeText)
+  2. 检查是否匹配 infinityKeywords:
+     a. 如 "10以上" → 数字部分="10", 关键词="以上"
+        → Range(10, Double.MAX_VALUE)
+     b. 如 "∞" → Range(0, Double.MAX_VALUE)
+  3. 检查是否匹配 zeroKeywords:
+     a. 如 "20以下" → 数字部分="20", 关键词="以下"
+        → Range(0, 20)
+  4. 尝试按 rangeSeparators 拆分:
+     a. 如 "10-15" → 按"-"拆分 → ["10", "15"]
+        → Range(10, 15)
+     b. 如 "10-∞" → 按"-"拆分 → ["10", "∞"]
+        → Range(10, Double.MAX_VALUE)
+  5. 尝试解析为单个数字:
+     a. 如 "10" → Range(10, 10) (精确值)
+  6. 解析失败 → 记录 WARNING, 返回 null(回退为整体精确匹配)
+```
+
+##### 规格拆分算法 (SpecRangeSplitter)
+
+```
+输入: fullSpec = "5#（10-15）", rangePattern
+
+算法:
+  1. 用 rangePattern 正则匹配 fullSpec
+  2. 若命中:
+     a. 捕获组1 = "10-15" (括号内文本)
+     b. 基础规格 = fullSpec 去掉匹配部分 = "5#"
+     c. 返回 SpecWithRange(baseSpec="5#", rangeText="10-15")
+  3. 若未命中:
+     a. 返回 SpecWithRange(baseSpec=fullSpec, rangeText=null)
+```
+
+##### 匹配示例
+
+```
+库存: 5#（10-15）   → base="5#", range=[10, 15]
+价格: 5#(10以上)    → base="5#", range=[10, +∞)
+
+策略=PRICE_CONTAINS_INVENTORY:
+  price.min(10) ≤ inv.min(10)  ✓
+  inv.max(15) ≤ price.max(+∞)  ✓
+  → 匹配成功 ✓
+
+──────────────────────────────────────────────
+
+库存: 5#（10-15）   → base="5#", range=[10, 15]
+价格: 5#(20以上)    → base="5#", range=[20, +∞)
+
+策略=PRICE_CONTAINS_INVENTORY:
+  price.min(20) ≤ inv.min(10)  ✗ (20 > 10)
+  → 匹配失败 ✗
+
+策略=RANGE_OVERLAP:
+  price.min(20) ≤ inv.max(15)  ✗ (20 > 15)
+  → 匹配失败 ✗ (完全不重叠)
+
+──────────────────────────────────────────────
+
+库存: 10#（5-10）   → base="10#", range=[5, 10]
+价格: 10#(8-20)     → base="10#", range=[8, 20]
+
+策略=PRICE_CONTAINS_INVENTORY:
+  price.min(8) ≤ inv.min(5)  ✗ (8 > 5)
+  → 匹配失败 ✗
+
+策略=RANGE_OVERLAP:
+  price.min(8) ≤ inv.max(10)  ✓
+  inv.min(5) ≤ price.max(20)  ✓
+  → 匹配成功 ✓ (区间 [8,10] 重叠)
+
+──────────────────────────────────────────────
+
+库存: 5#             → base="5#", range=null
+价格: 5#(10以上)     → base="5#", range=[10, +∞)
+
+规则: 库存无区间时, 只匹配基础规格, 忽略价格区间
+→ 匹配成功 ✓ (base相等, 库存无区间约束)
+```
 
 ---
 
@@ -778,7 +921,8 @@ com.eiss.erp.defineimport
 │   ├── CharTransformer.java                    // ★ 字符转换引擎(三级规则合并+有序管道执行)
 │   ├── RowInheritResolver.java                 // ★ v1.2 行间继承解析器(规格前缀继承)
 │   ├── FieldValueMapper.java                   // ★ v1.2 通用字段值映射(品类/产地/材质, 原 CategoryMapper)
-│   ├── PriceMatcher.java                       // 价格→库存匹配器
+│   ├── SpecRangeParser.java                    // ★ v1.3 规格区间后缀解析器(拆分基础规格+区间)
+│   ├── PriceMatcher.java                       // 价格→库存匹配器(v1.3 增强: 支持规格区间匹配)
 │   └── DataValidator.java                      // 数据校验器
 │
 ├── model/
@@ -824,7 +968,8 @@ com.eiss.erp.defineimport
 │   │   ├── ColumnHeaderSourceConfig.java
 │   │   ├── TransformConfig.java
 │   │   ├── CharTransformConfig.java             // 字符转换配置(含 fieldRules, excludePresetCodes等)
-│   │   └── RowInheritConfig.java                // v1.2 行间继承配置
+│   │   ├── RowInheritConfig.java                // v1.2 行间继承配置
+│   │   └── SpecRangeConfig.java                 // v1.3 规格区间解析配置
 │   │
 │   └── enums/
 │       ├── ContentTypeEnum.java                // INVENTORY(1), PRICE(2)
@@ -847,7 +992,7 @@ com.eiss.erp.defineimport
 └── util/
     ├── CellRefUtil.java                        // "B3" ↔ (row=2, col=1) 互转
     ├── SpecParseUtil.java                      // 规格字符串解析(提取宽、高、壁厚)
-    ├── RangeUtil.java                          // 区间解析与匹配("0.5-1.0" → [0.5, 1.0])
+    ├── RangeUtil.java                          // 区间解析与匹配("0.5-1.0" → [0.5, 1.0], "10以上" → [10, +∞))
     └── SafeConvertUtil.java                    // 安全类型转换(String→BigDecimal, 含异常处理)
 ```
 
@@ -1006,7 +1151,7 @@ com.eiss.erp.defineimport
   - 无额外内存开销, 仅保存一个字符串缓存
 ```
 
-#### PriceMatcher（价格→库存匹配器）
+#### PriceMatcher（价格→库存匹配器）★ v1.3 增强
 
 ```
 职责: 将解析出的价格记录匹配到库存记录, 填入库存的 price 字段
@@ -1015,14 +1160,87 @@ com.eiss.erp.defineimport
   1. 读取 PriceMatchRule, 确定参与匹配的字段列表
   2. 对每条价格记录:
      a. 提取匹配键: category + spec + origin + material (按规则)
-     b. 若 wall_thickness_match_mode=1(区间匹配):
+
+     b. 若 spec_range_match_mode=1(规格区间匹配) ★v1.3:
+        - 调用 SpecRangeParser 拆分库存规格:
+          "5#（10-15）" → baseSpec="5#", invRange=[10, 15]
+        - 调用 SpecRangeParser 拆分价格规格:
+          "5#(10以上)" → baseSpec="5#", priceRange=[10, +∞)
+        - 先匹配 baseSpec 是否相等
+        - 再按 matchStrategy 判断区间关系:
+          · PRICE_CONTAINS_INVENTORY: priceRange 完全包含 invRange
+          · RANGE_OVERLAP: 两区间存在交集
+          · INVENTORY_MIN_IN_PRICE: 库存下界落在价格区间内
+          · BASE_SPEC_ONLY: 仅匹配基础规格
+        - 特殊处理: 库存无区间后缀 → 只匹配基础规格(忽略价格区间)
+
+     c. 若 spec_range_match_mode=0(不处理区间):
+        - spec 作为整体精确匹配键
+
+     d. 若 wall_thickness_match_mode=1(壁厚区间匹配):
         - 从价格记录解析壁厚区间 [min, max]
         - 从库存记录解析壁厚精确值 val
         - 匹配条件: min <= val <= max
-     c. 若 wall_thickness_match_mode=0(精确匹配):
+     e. 若 wall_thickness_match_mode=0(壁厚精确匹配):
         - 壁厚也作为精确匹配键
+
   3. 匹配成功 → 将价格写入库存记录的 price 字段
   4. 未匹配的价格 → 生成 ExcelImportError
+```
+
+#### SpecRangeParser（规格区间后缀解析器）★ v1.3 新增
+
+```
+职责: 将带区间后缀的规格字符串拆分为"基础规格"和"区间范围"
+
+输入: specValue(如 "5#（10-15）") + SpecRangeConfig
+输出: SpecWithRange(baseSpec, Range)
+
+核心方法:
+  - parse(specValue, config) → SpecWithRange
+
+数据结构:
+  SpecWithRange {
+      String baseSpec;     // "5#"
+      Range  range;        // nullable, [10, 15] 或 [10, +∞)
+  }
+  Range {
+      double min;          // 下界
+      double max;          // 上界, Double.MAX_VALUE 表示正无穷
+      boolean minInclusive;// 下界是否包含, 默认 true
+      boolean maxInclusive;// 上界是否包含, 默认 true
+  }
+
+算法:
+  1. 用 config.rangePattern 匹配规格字符串末尾的括号部分
+     正则默认: [（(]([^）)]+)[）)]\s*$
+     示例: "5#（10-15）" → 捕获组1="10-15", baseSpec="5#"
+
+  2. 对捕获的括号内文本 rangeText, 解析为 Range:
+     a. 检查 infinityKeywords:
+        "10以上" → 提取数字"10" + 关键词"以上" → Range(10, MAX)
+        "∞"     → Range(0, MAX)
+        "10+"   → Range(10, MAX)
+     b. 检查 zeroKeywords:
+        "20以下" → Range(0, 20)
+     c. 按 rangeSeparators 拆分:
+        "10-15"  → Range(10, 15)
+        "10-∞"   → Range(10, MAX)
+        "10~20"  → Range(10, 20)
+     d. 单个数字:
+        "10"     → Range(10, 10)
+     e. 无法解析 → null, 记录 WARNING
+
+  3. 返回 SpecWithRange(baseSpec, range)
+
+性能:
+  - rangePattern 预编译, 缓存 Pattern 对象
+  - 解析结果可按 specValue 缓存(同一规格不重复解析)
+
+错误处理:
+  - 括号不匹配(有开无关) → 整体作为 baseSpec, range=null
+  - 区间文本无法解析 → 记录 WARNING, range=null, 回退为精确匹配
+  - 数值转换失败 → 同上
 ```
 
 #### DataValidator（数据校验器）
@@ -1621,7 +1839,8 @@ src/
 │   │   ├── CharRuleTestPanel.vue             // ★ 字符转换规则测试面板
 │   │   ├── FieldValueMappingEditor.vue        // ★ v1.2 通用字段值映射编辑(品类/产地/材质)
 │   │   ├── RowInheritConfigForm.vue           // ★ v1.2 行间继承配置
-│   │   └── PriceMatchRuleForm.vue            // 价格匹配规则
+│   │   ├── SpecRangeConfigForm.vue           // ★ v1.3 规格区间后缀匹配配置
+│   │   └── PriceMatchRuleForm.vue            // 价格匹配规则(v1.3 增强: 区间匹配策略选择)
 │   │
 │   └── import-result/
 │       ├── PreviewTable.vue                  // 导入预览表格
@@ -2317,6 +2536,74 @@ Row 8: |          | 25*3.5 | 9     | 5.2   |
 
 **解析结果**: 2行 × 3组 = 6 条价格记录，每条都有独立的品类+规格+产地+材质+价格。
 
+### 场景 11：规格附带区间后缀匹配（镀锌型材）★ v1.3 新增
+
+**库存表**:
+```
+| 品类     | 规格        | 产地 | 重量  |
+|---------|------------|------|-------|
+| 镀锌槽钢 | 5#（10-15） | 唐山 | 12.5  |
+| 镀锌槽钢 | 5#（15-20） | 唐山 | 18.0  |
+| 镀锌槽钢 | 10#（5-10） | 邯郸 | 7.5   |
+| 镀锌槽钢 | 10#         | 天津 | 3.0   |
+```
+
+**价格表**:
+```
+| 品类     | 规格        | 单价  |
+|---------|------------|-------|
+| 镀锌槽钢 | 5#(10以上)  | 4200  |
+| 镀锌槽钢 | 5#(10以下)  | 4500  |
+| 镀锌槽钢 | 10#(8-20)  | 4100  |
+| 镀锌槽钢 | 10#(8+)    | 4100  |
+```
+
+**模板配置要点**:
+- priceMatchRule:
+```json
+{
+    "matchFields": ["category", "spec", "origin"],
+    "specRangeMatchMode": 1,
+    "specRangeConfig": {
+        "rangePattern": "[（(]([^）)]+)[）)]\\s*$",
+        "rangeSeparators": ["-", "~"],
+        "infinityKeywords": ["以上", "+", "∞", "及以上"],
+        "zeroKeywords": ["以下", "及以下"],
+        "matchStrategy": "PRICE_CONTAINS_INVENTORY"
+    }
+}
+```
+
+**匹配过程** (策略=PRICE_CONTAINS_INVENTORY):
+
+```
+库存                    价格                   基础规格   库存区间    价格区间      匹配结果
+─────────────────────────────────────────────────────────────────────────────────────────
+5#（10-15）             5#(10以上)              5#=5# ✓   [10,15]    [10,+∞)      price.min(10)≤inv.min(10) ✓ inv.max(15)≤price.max(+∞) ✓ → 匹配 ✓ price=4200
+5#（15-20）             5#(10以上)              5#=5# ✓   [15,20]    [10,+∞)      price.min(10)≤inv.min(15) ✓ inv.max(20)≤price.max(+∞) ✓ → 匹配 ✓ price=4200
+10#（5-10）             10#(8-20)               10#=10# ✓ [5,10]     [8,20]       price.min(8)≤inv.min(5) ✗ (8>5) → 匹配失败 ✗
+10#（5-10）             10#(8+)                 10#=10# ✓ [5,10]     [8,+∞)       price.min(8)≤inv.min(5) ✗ → 匹配失败 ✗
+10#(无区间后缀)          10#(8-20)               10#=10# ✓ 无区间     [8,20]       库存无区间 → 仅匹配base → 匹配 ✓ price=4100
+```
+
+> **注意**: 库存 `10#（5-10）` 在 PRICE_CONTAINS_INVENTORY 策略下无法匹配 `10#(8-20)`，因为价格区间 [8,20] 不完全包含库存区间 [5,10]。若改为 `RANGE_OVERLAP` 策略则可匹配（[5,10] 与 [8,20] 有交集 [8,10]）。策略选择取决于业务规则。
+
+**带各种特殊符号的区间表达速查**:
+
+```
+原始规格文本          rangePattern解析              基础规格   区间
+───────────────────────────────────────────────────────────────
+5#（10-15）           捕获"10-15"                   5#        [10, 15]
+5#(10以上)            捕获"10以上"                   5#        [10, +∞)
+5#(10+)               捕获"10+"                     5#        [10, +∞)
+5#(10-∞)              捕获"10-∞"                    5#        [10, +∞)
+5#(∞)                 捕获"∞"                       5#        [0, +∞)
+5#(20以下)            捕获"20以下"                   5#        [0, 20]
+5#（10～20）           捕获"10～20"(需在separators加~) 5#        [10, 20]
+5#                    未命中pattern                  5#        null
+50*100*2.0            未命中pattern                  50*100*2.0 null
+```
+
 ---
 
 ## 十二、安全与健壮性设计
@@ -2382,7 +2669,8 @@ public class SafeConvertUtil {
 | `CharRulePresetTest` | ★ 系统预置规则覆盖率: 所有INSERT初始数据的正确性验证 |
 | `FieldValueMapperTest` | 品类/产地/材质映射命中/未命中/通配/多字段联合 |
 | `RowInheritResolverTest` | 完整规格/部分值/连续部分值/前缀切换/空值/首行即部分值 |
-| `PriceMatcherTest` | 精确匹配、壁厚区间匹配 |
+| `SpecRangeParserTest` | ★ v1.3 括号解析、各种区间表达(以上/以下/+/∞/数字-数字)、无区间规格、全半角括号混用、解析失败容错 |
+| `PriceMatcherTest` | 精确匹配、壁厚区间匹配、★ v1.3 规格区间匹配(四种策略)、库存无区间回退、base规格不等短路 |
 | `MergeCellCollectorTest` | 合并区域填充、边界条件 |
 | `SafeConvertUtilTest` | 各种异常字符串的安全转换 |
 | `DynamicExcelParserTest` | 完整的端到端解析测试(含样本 Excel) |
@@ -2409,6 +2697,8 @@ public class SafeConvertUtil {
 | 正则表达式书写错误 | 字符转换规则报错或死循环(ReDOS) | 后端正则预编译时 try-catch + 超时保护; 前端提供下拉预设降低手写正则频率 |
 | 字符转换规则冲突/顺序问题 | 先替换的字符影响后续规则匹配 | 严格按 sort_order 执行 + 测试面板实时显示每步中间结果 |
 | 新出现的特殊符号未覆盖 | 导入后规格不标准, 影响价格匹配 | 系统预置规则可由管理员在线新增, 无需发版 |
+| 区间后缀表达多样性 | 新供应商使用未覆盖的区间关键词 | infinityKeywords/zeroKeywords 可配置扩展; 解析失败时回退精确匹配并记录 WARNING |
+| 区间匹配策略选择困难 | 不同品类可能需要不同匹配策略 | 支持 4 种策略可选, 可在模板/Sheet 级分别配置 |
 
 ---
 
