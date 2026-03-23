@@ -8,7 +8,8 @@
 > v1.4 变更：完成 6 项扩展方向的完整设计  
 > v1.5 变更：万人并发导入架构设计  
 > v1.6 变更：新增「库存与价格分批导入 + 跨批次价格回写」——支持先导库存后导价格，价格自动回写已入库库存  
-> v1.7 变更：备注(remark)字段升级为规则驱动——支持固定值/固定单元格/表头派生/字段值映射/组级固定，与产地/材质同等规则能力  
+> v1.7 变更：备注(remark)字段升级为规则驱动——与产地/材质同等规则能力  
+> v1.8 变更：新增库存数据重复性检测——按品类+规格+产地+材质+备注唯一键去重，重复行不导入并明确提示  
 
 ---
 
@@ -1440,21 +1441,62 @@ com.eiss.erp.defineimport
   - 数值转换失败 → 同上
 ```
 
-#### DataValidator（数据校验器）
+#### DataValidator（数据校验器）★ v1.8 增强：重复性检测
 
 ```
-职责: 对解析后的每行数据进行业务校验
+职责: 对解析后的每行数据进行业务校验, 包含行级校验和批次级去重校验
 
 校验规则:
   1. 必填校验: required=1 的字段不能为空
   2. 数值校验: price/weight/package_num 等字段必须是合法数值
   3. 枚举校验: content_type 等枚举值必须在合法范围内
   4. 业务规则: 库存记录的品类+规格不能为空等
+  5. ★ v1.8 重复性检测: 同批次内 品类+规格+产地+材质+备注 唯一键去重
+
+重复性检测算法 (DuplicateDetector):
+
+  唯一键: category + "|" + spec + "|" + origin + "|" + material + "|" + remark
+         (null 值统一为空字符串参与拼接, 避免 null 歧义)
+
+  数据结构:
+    Map<String uniqueKey, DuplicateEntry> seen = new LinkedHashMap<>()
+    DuplicateEntry { int firstRowIndex, String sheetName, int count }
+
+  检测过程(对每行 ParsedRowDto):
+    1. 构建 uniqueKey = join("|", category, spec, origin, material, remark)
+    2. 查询 seen.get(uniqueKey):
+       a. 未命中 → seen.put(uniqueKey, {rowIndex, sheetName, 1}) → 行数据正常保留
+       b. 命中(已存在) → 此行为重复行:
+          · 不加入 parsedRows(不导入)
+          · 生成 ExcelImportError:
+            {
+              sheetName: 当前Sheet,
+              rowIndex: 当前行号,
+              fieldName: "唯一键(品类+规格+产地+材质+备注)",
+              errorMsg: "数据重复: 与第{firstRowIndex}行重复(品类={category}, 规格={spec}, 产地={origin}, 材质={material}, 备注={remark})",
+              rawValue: uniqueKey,
+              errorLevel: "ERROR"
+            }
+          · seen.get(uniqueKey).count++
+
+  3. 跨 Sheet 去重:
+     同一模板内多个库存 Sheet 共享同一个 seen Map
+     Sheet A 第3行的"槽钢|10#|唐山|Q235B|" 和 Sheet B 第5行相同 → 第5行标为重复
+
+  4. 跨批次去重(可选, 通过配置开关控制):
+     若 duplicate_check_mode 包含 CROSS_BATCH:
+       在构建 seen 前, 先从 import_inventory_data 加载同供应商最近一次库存的唯一键集合
+       已入库的数据也参与去重判断
+
+  5. 汇总统计:
+     解析完成后, 生成去重统计:
+       { totalDuplicateRows: 12, uniqueKeysAffected: 5, firstOccurrenceKept: true }
 
 错误处理:
   - 每个校验失败生成一条 ExcelImportError
   - 包含: 行号、列号、字段名、错误原因、原始值
   - 错误不中断解析, 继续处理后续行
+  - ★ 重复行不加入 parsedRows(不导入), 但完整记录错误信息供用户查看
 ```
 
 #### CharTransformer（字符转换引擎）★ v1.1 新增
@@ -2073,7 +2115,19 @@ com.eiss.erp.defineimport
                 "colIndex": 6,
                 "fieldName": "重量",
                 "errorMsg": "数值格式错误: '约5吨' 无法转换为数值",
-                "rawValue": "约5吨"
+                "rawValue": "约5吨",
+                "errorType": "NUMERIC"
+            },
+            {
+                "sheetName": "库存",
+                "rowIndex": 22,
+                "fieldName": "唯一键(品类+规格+产地+材质+备注)",
+                "errorMsg": "数据重复: 与第8行重复(品类=槽钢, 规格=10#, 产地=唐山, 材质=Q235B, 备注=)",
+                "rawValue": "槽钢|10#|唐山|Q235B|",
+                "errorType": "DUPLICATE",
+                "errorLevel": "ERROR",
+                "duplicateOfRow": 8,
+                "duplicateOfSheet": "库存"
             }
         ],
         "summary": {
@@ -2081,8 +2135,9 @@ com.eiss.erp.defineimport
             "inventorySheets": 1,
             "priceSheets": 1,
             "totalRows": 120,
-            "successRows": 118,
+            "successRows": 115,
             "errorRows": 2,
+            "duplicateRows": 3,
             "priceMatchedRows": 95,
             "priceUnmatchedRows": 23
         }
@@ -2419,6 +2474,16 @@ public class DynamicExcelListener extends AnalysisEventListener<Map<Integer, Cel
             try {
                 ParsedRowDto row = resolveRow(currentRow, rowData, group);
                 if (row != null) {
+                    // v1.8 重复性检测: 品类+规格+产地+材质+备注
+                    if (sheetConfig.getContentType() == ContentTypeEnum.INVENTORY) {
+                        String uniqueKey = duplicateDetector.buildKey(row);
+                        DuplicateEntry existing = duplicateDetector.check(uniqueKey, currentRow, sheetConfig.getSheetName());
+                        if (existing != null) {
+                            errors.add(buildDuplicateError(currentRow, sheetConfig.getSheetName(),
+                                existing.getFirstRowIndex(), existing.getSheetName(), row, uniqueKey));
+                            continue; // 重复行不加入 parsedRows
+                        }
+                    }
                     parsedRows.add(row);
                 }
             } catch (Exception e) {
@@ -3060,6 +3125,7 @@ K8s HPA 配置:
 | 数值转换失败 | "约5吨" → BigDecimal 失败 | 记录行级错误, 继续解析后续行 |
 | 必填字段为空 | 品类列为空且无默认值 | 记录行级错误, 继续解析 |
 | 品类映射未命中 | 原始品类+限定词 无匹配规则 | 使用原始品类值(透传), 记录警告 |
+| ★ 数据重复 | 品类+规格+产地+材质+备注 与已有行重复 | **不导入**, 记录行级错误, 标明与哪行重复 |
 | 价格匹配失败 | 价格记录未匹配到任何库存 | 记录到未匹配列表, 在预览中展示 |
 | 文件格式错误 | 非 xlsx/xls 文件 | 立即返回, 提示文件格式错误 |
 
@@ -3067,13 +3133,16 @@ K8s HPA 配置:
 
 ```java
 public class ExcelImportError {
-    private String sheetName;       // Sheet页名称
-    private Integer rowIndex;       // 行号(1开始, 对用户友好)
-    private Integer colIndex;       // 列号
-    private String fieldName;       // 字段中文名
-    private String errorMsg;        // 错误描述
-    private String rawValue;        // 原始值
-    private String errorLevel;      // ERROR / WARNING
+    private String sheetName;           // Sheet页名称
+    private Integer rowIndex;           // 行号(1开始, 对用户友好)
+    private Integer colIndex;           // 列号
+    private String fieldName;           // 字段中文名
+    private String errorMsg;            // 错误描述
+    private String rawValue;            // 原始值
+    private String errorLevel;          // ERROR / WARNING
+    private String errorType;           // v1.8 错误类型: REQUIRED/NUMERIC/DUPLICATE/MATCH_FAIL/...
+    private Integer duplicateOfRow;     // v1.8 重复行专用: 与哪一行重复(首次出现的行号)
+    private String duplicateOfSheet;    // v1.8 重复行专用: 重复行所在的Sheet名
 }
 ```
 
@@ -3617,6 +3686,7 @@ public class SafeConvertUtil {
 | `RowInheritResolverTest` | 完整规格/部分值/连续部分值/前缀切换/空值/首行即部分值 |
 | `SpecRangeParserTest` | ★ v1.3 括号解析、各种区间表达(以上/以下/+/∞/数字-数字)、无区间规格、全半角括号混用、解析失败容错 |
 | `PriceMatcherTest` | 精确匹配、壁厚区间匹配、★ v1.3 规格区间匹配(四种策略)、库存无区间回退、base规格不等短路 |
+| `DuplicateDetectorTest` | ★ v1.8 同Sheet重复/跨Sheet重复/null字段处理/首行保留/重复计数/跨批次去重/空备注vs有备注不重复 |
 | `PriceWritebackExecutorTest` | ★ v1.6 跨批次回写:按batchNo/按supplierId自动查找/三种writebackMode/并发锁/未匹配报告/未赋价统计 |
 | `MergeCellCollectorTest` | 合并区域填充、边界条件 |
 | `SafeConvertUtilTest` | 各种异常字符串的安全转换 |
