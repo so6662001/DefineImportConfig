@@ -1,7 +1,8 @@
 # 钢贸动态 Excel 导入系统 — 详细设计文档
 
-> 版本：v1.0  
+> 版本：v1.1  
 > 技术栈：Java 17 + Spring Boot + Alibaba EasyExcel + MyBatis-Plus + MySQL + Vue 3  
+> v1.1 变更：新增「规格特殊符号转换」子系统设计（第三章新增表、第 3.3.3 节、第五章新增引擎类、第七章新增组件、第十一章新增场景5）  
 
 ---
 
@@ -21,6 +22,7 @@
 | 多 Sheet 页 | 一个文件包含库存 + 价格，类型不同 |
 | 品类灵活 | 品类列值 + 表头/单元格 → 派生新品类名称 |
 | 价格列灵活 | 表头是产地/材质名称，表体是价格，一个 Sheet 可有多产地、多材质 |
+| 规格特殊符号 | 规格中存在大量特殊符号需要归一化：全角×→半角*、Φ/φ/∅→清除、中文括号→英文括号、异形连字符→标准连字符等 |
 | 规格组合 | 规格 = 多列拼接（如规格 + 壁厚），壁厚可能是区间值 |
 
 ### 1.2 核心目标
@@ -116,7 +118,11 @@ import_template (1) ──┬──< import_template_sheet (N)
                       │         │
                       │         └──< import_template_price_match_rule (0..1)
                       │
+                      ├──< import_template_char_rule (P)   ← 模板级字符转换规则
+                      │
                       └── 关联 supplier(供应商)
+
+import_char_rule_preset (独立)                              ← 系统预置字符转换规则
 ```
 
 ### 3.2 DDL
@@ -276,6 +282,83 @@ CREATE TABLE `import_record` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='导入记录表';
 ```
 
+-- ============================================================
+-- 8. 系统预置字符转换规则表(全局通用, 不绑定模板)
+-- ============================================================
+CREATE TABLE `import_char_rule_preset` (
+    `id`                BIGINT          NOT NULL AUTO_INCREMENT  COMMENT '主键',
+    `rule_code`         VARCHAR(64)     NOT NULL                 COMMENT '规则编码(唯一)',
+    `rule_name`         VARCHAR(128)    NOT NULL                 COMMENT '规则名称(如: 全角转半角)',
+    `rule_group`        VARCHAR(64)     NOT NULL DEFAULT 'COMMON' COMMENT '规则分组: COMMON-通用 / SPEC-规格专用 / UNIT-单位相关',
+    `match_type`        VARCHAR(32)     NOT NULL                 COMMENT '匹配方式: LITERAL-精确字符 / REGEX-正则表达式 / FULLWIDTH-全角转半角 / CHARCLASS-字符类',
+    `match_pattern`     VARCHAR(256)    NOT NULL                 COMMENT '匹配模式(精确字符串或正则)',
+    `replace_value`     VARCHAR(256)    NOT NULL DEFAULT ''      COMMENT '替换为的值(空字符串=删除该字符)',
+    `description`       VARCHAR(256)    DEFAULT NULL             COMMENT '说明(如: 全角乘号转半角星号)',
+    `sort_order`        INT             NOT NULL DEFAULT 0       COMMENT '执行顺序(升序, 越小越先执行)',
+    `enabled`           TINYINT         NOT NULL DEFAULT 1       COMMENT '是否启用 0-否 1-是',
+    `create_time`       DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `update_time`       DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    `deleted`           TINYINT         NOT NULL DEFAULT 0,
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_rule_code` (`rule_code`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='系统预置字符转换规则表';
+
+
+-- ============================================================
+-- 9. 模板字符转换规则表(模板级, 可引用预置或自定义)
+-- ============================================================
+CREATE TABLE `import_template_char_rule` (
+    `id`                BIGINT          NOT NULL AUTO_INCREMENT  COMMENT '主键',
+    `template_id`       BIGINT          NOT NULL                 COMMENT '模板ID',
+    `apply_field_codes` JSON            DEFAULT NULL             COMMENT '适用字段列表(null=适用所有文本字段) 如["spec","category"]',
+    `preset_rule_id`    BIGINT          DEFAULT NULL             COMMENT '引用的预置规则ID(不为空时以预置规则为准)',
+    `match_type`        VARCHAR(32)     DEFAULT NULL             COMMENT '匹配方式(自定义规则时使用)',
+    `match_pattern`     VARCHAR(256)    DEFAULT NULL             COMMENT '匹配模式(自定义规则时使用)',
+    `replace_value`     VARCHAR(256)    DEFAULT NULL             COMMENT '替换值(自定义规则时使用)',
+    `description`       VARCHAR(256)    DEFAULT NULL             COMMENT '说明',
+    `sort_order`        INT             NOT NULL DEFAULT 0       COMMENT '执行顺序(升序, 越小越先执行)',
+    `enabled`           TINYINT         NOT NULL DEFAULT 1       COMMENT '是否启用 0-否 1-是',
+    `create_time`       DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `update_time`       DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    `deleted`           TINYINT         NOT NULL DEFAULT 0,
+    PRIMARY KEY (`id`),
+    KEY `idx_template_id` (`template_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='模板字符转换规则表';
+
+
+-- ============================================================
+-- 预置规则初始化数据(钢贸行业常见特殊符号)
+-- ============================================================
+INSERT INTO `import_char_rule_preset` (`rule_code`, `rule_name`, `rule_group`, `match_type`, `match_pattern`, `replace_value`, `description`, `sort_order`) VALUES
+-- 全角→半角 基础符号
+('FULLWIDTH_STAR',       '全角×→半角*',      'SPEC',    'LITERAL',   '×',   '*',  '全角乘号转半角星号, 规格分隔符归一化',          10),
+('FULLWIDTH_X_UPPER',    '全角Ｘ→半角*',     'SPEC',    'LITERAL',   'Ｘ',  '*',  '全角大写X转半角星号',                          11),
+('LOWERCASE_X_SEP',      '小写x→半角*',      'SPEC',    'REGEX',     '(?<=\\d)x(?=\\d)', '*', '数字间的小写x视为乘号',          12),
+('UPPERCASE_X_SEP',      '大写X→半角*',      'SPEC',    'REGEX',     '(?<=\\d)X(?=\\d)', '*', '数字间的大写X视为乘号',          13),
+('FULLWIDTH_HYPHEN',     '全角－→半角-',     'COMMON',  'LITERAL',   '－',  '-',  '全角减号/连字符转半角',                        20),
+('EN_DASH',              '半角–→半角-',      'COMMON',  'LITERAL',   '–',   '-',  'EN DASH 转标准连字符',                        21),
+('EM_DASH',              '全角—→半角-',      'COMMON',  'LITERAL',   '—',   '-',  'EM DASH 转标准连字符',                        22),
+('FULLWIDTH_DOT',        '全角．→半角.',     'COMMON',  'LITERAL',   '．',  '.',  '全角句点转半角点(小数点)',                      23),
+('FULLWIDTH_LPAREN',     '全角（→半角(',     'COMMON',  'LITERAL',   '（',  '(',  '全角左括号转半角',                             30),
+('FULLWIDTH_RPAREN',     '全角）→半角)',     'COMMON',  'LITERAL',   '）',  ')',  '全角右括号转半角',                             31),
+('FULLWIDTH_SLASH',      '全角／→半角/',     'COMMON',  'LITERAL',   '／',  '/',  '全角斜杠转半角',                              32),
+-- 直径符号
+('PHI_UPPER',            '大写Φ→清除',       'SPEC',    'LITERAL',   'Φ',   '',   '大写希腊字母Phi(直径符号)清除',                 40),
+('PHI_LOWER',            '小写φ→清除',       'SPEC',    'LITERAL',   'φ',   '',   '小写希腊字母phi清除',                          41),
+('DIAMETER_SIGN',        '∅→清除',           'SPEC',    'LITERAL',   '∅',   '',   'Unicode直径符号清除',                          42),
+('PHI_FULLWIDTH',        'Ф→清除',           'SPEC',    'LITERAL',   'Ф',   '',   '西里尔字母Ef(常被误用为直径)清除',               43),
+-- 空白字符
+('NBSP',                 '不间断空格→清除',   'COMMON',  'LITERAL',   ' ',   '',   'Unicode不间断空格(U+00A0)清除',               50),
+('IDEOGRAPHIC_SPACE',    '全角空格→清除',     'COMMON',  'LITERAL',   '　',  '',   '全角空格(U+3000)清除',                        51),
+('MULTI_SPACES',         '连续空格→单空格',   'COMMON',  'REGEX',     '\\s{2,}', ' ', '多个连续空白压缩为单个空格',                52),
+-- 井号处理(可选, 默认不启用)
+('HASH_SIGN',            '#号→清除',          'SPEC',    'LITERAL',   '#',   '',   '井号清除(部分规格如10#中的#)',                  60),
+-- 全角数字
+('FULLWIDTH_DIGITS',     '全角数字→半角',     'COMMON',  'FULLWIDTH', '０-９', '0-9', '全角数字0-9转半角',                        70);
+
+
+```
+
 ### 3.3 核心 JSON 配置结构详解
 
 #### 3.3.1 source_config 各类型详解
@@ -356,10 +439,16 @@ CREATE TABLE `import_record` (
     "rangeDelimiter": "-",
     "parseAsRange": false,
     "regexExtract": null,
-    "replacements": [
-        { "from": "Φ", "to": "" },
-        { "from": "×", "to": "*" }
-    ]
+
+    "charTransform": {
+        "useTemplateRules": true,
+        "usePresetGroups": ["SPEC", "COMMON"],
+        "fieldRules": [
+            { "matchType": "LITERAL", "matchPattern": "×", "replaceValue": "*" },
+            { "matchType": "REGEX", "matchPattern": "(?<=\\d)[xX](?=\\d)", "replaceValue": "*" }
+        ],
+        "excludePresetCodes": ["HASH_SIGN"]
+    }
 }
 ```
 
@@ -371,7 +460,117 @@ CREATE TABLE `import_record` (
 | `parseAsRange` | 是否解析为区间值(壁厚场景) |
 | `rangeDelimiter` | 区间分隔符(如 "-") |
 | `regexExtract` | 正则提取(提取规格中的数字部分等) |
-| `replacements` | 文本替换规则 |
+| `charTransform` | **★ 字符转换配置**（见下方 3.3.3 详解） |
+
+#### 3.3.3 charTransform 字符转换子系统详解
+
+##### 设计理念：三级规则 + 有序管道
+
+规格字段中的特殊符号在不同供应商的 Excel 中表现形式各异，同一个 `*` 分隔符可能写成 `×`、`Ｘ`、`x`、`X`、`﹡` 等。为此设计**三级规则体系**，按优先级合并后按 `sort_order` 顺序执行：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                   字符转换执行管道                            │
+│                                                             │
+│  ① 系统预置规则 (import_char_rule_preset)                    │
+│     └─ 按 rule_group 筛选 + 全局启用的规则                   │
+│                     ↓ 合并                                   │
+│  ② 模板级规则 (import_template_char_rule)                    │
+│     └─ 当前模板配置的规则(可引用预置或自定义)                  │
+│                     ↓ 合并                                   │
+│  ③ 字段级规则 (transform_config.charTransform.fieldRules)    │
+│     └─ 当前字段特有的转换规则                                 │
+│                     ↓                                        │
+│  按 sort_order 排序 → 去重(字段级 > 模板级 > 系统级) → 顺序执行│
+└─────────────────────────────────────────────────────────────┘
+```
+
+##### charTransform JSON 字段说明
+
+```json
+{
+    "useTemplateRules": true,
+    "usePresetGroups": ["SPEC", "COMMON"],
+    "fieldRules": [
+        {
+            "matchType": "LITERAL",
+            "matchPattern": "㎜",
+            "replaceValue": "mm",
+            "sortOrder": 100,
+            "description": "平方毫米符号转标准写法"
+        }
+    ],
+    "excludePresetCodes": ["HASH_SIGN", "MULTI_SPACES"]
+}
+```
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `useTemplateRules` | boolean | 是否应用模板级字符转换规则，默认 true |
+| `usePresetGroups` | string[] | 引用的系统预置规则分组，如 `["SPEC","COMMON"]`。为 null 或空 = 使用当前字段的 field_code 自动推断 |
+| `fieldRules` | object[] | 字段级自定义转换规则（仅对当前字段生效） |
+| `excludePresetCodes` | string[] | 需排除的预置规则编码（如规格中想保留 `#` 号，排除 `HASH_SIGN`） |
+
+##### 字段级规则 (fieldRules) 每条的结构
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `matchType` | string | `LITERAL` / `REGEX` / `FULLWIDTH` / `CHARCLASS` |
+| `matchPattern` | string | 匹配模式 |
+| `replaceValue` | string | 替换值（空字符串 = 删除） |
+| `sortOrder` | int | 执行顺序，默认 0 |
+| `description` | string | 规则说明（便于运维理解） |
+
+##### matchType 四种匹配模式详解
+
+| 模式 | 说明 | matchPattern 示例 | replaceValue 示例 |
+|------|------|------------------|------------------|
+| `LITERAL` | 精确字符/字符串替换 | `×` | `*` |
+| `REGEX` | Java 正则表达式替换 | `(?<=\d)[xX](?=\d)` | `*` |
+| `FULLWIDTH` | 全角→半角批量转换 | `０-９` | `0-9`（按码位偏移转换） |
+| `CHARCLASS` | Unicode 字符类清除 | `[\u00A0\u3000\u200B]` | `` (清除不可见字符) |
+
+##### 钢贸行业常见规格特殊符号速查
+
+```
+原始值(供应商Excel)          →  标准化后
+──────────────────────────────────────────
+50×100×2.0                   →  50*100*2.0      (全角×→半角*)
+Φ219×6                       →  219*6           (Φ删除, ×→*)
+∅76×4.0                      →  76*4.0          (∅删除, ×→*)
+50X100X2.0                   →  50*100*2.0      (大写X→*)
+100﹡50﹡3                    →  100*50*3        (小型星号→*)
+HW200×200                    →  HW200*200       (×→*, 保留字母前缀)
+10#                          →  10#  (或 10)    (可配置是否清除#)
+（50×100）                    →  (50*100)        (全角括号→半角)
+２００＊３００                  →  200*300         (全角数字→半角, 全角*→半角)
+50*100 * 2.0                 →  50*100*2.0      (清除多余空格)
+40×80×1.0—1.5                →  40*80*1.0-1.5   (全角—→半角-)
+```
+
+##### 执行时序（在 DataTransformer 中）
+
+```
+原始值 rawValue
+    │
+    ├─ Step 1: trimWhitespace (去首尾空白)
+    │
+    ├─ Step 2: ★ charTransform (字符转换管道)   ← 新增, 在其他清洗之前执行
+    │   │
+    │   ├─ 2a. 收集规则: 预置(按group) + 模板级 + 字段级
+    │   ├─ 2b. 排除 excludePresetCodes 中指定的预置规则
+    │   ├─ 2c. 合并去重, 按 sort_order 升序排列
+    │   └─ 2d. 逐条执行: LITERAL→String.replace / REGEX→Pattern.replaceAll / ...
+    │
+    ├─ Step 3: removeUnit (去单位, 如 "吨")
+    ├─ Step 4: regexExtract (正则提取)
+    ├─ Step 5: numericPrecision (数值精度处理)
+    └─ Step 6: parseAsRange (区间解析)
+
+输出 cleanValue
+```
+
+> **关键设计决策**：字符转换（Step 2）在去单位（Step 3）之前执行，因为去单位依赖于标准化后的字符（如全角"吨"需要先转为半角才能被 unitPatterns 匹配），同时在数值转换之前确保所有数字和分隔符已标准化。
 
 #### 3.3.3 match_fields 详解
 
@@ -427,7 +626,8 @@ com.eiss.erp.defineimport
 │   ├── MergeCellCollector.java                 // 合并单元格收集器
 │   ├── HeaderMatcher.java                      // 表头匹配器
 │   ├── FieldValueResolver.java                 // 字段值解析器(根据 source_type 取值)
-│   ├── DataTransformer.java                    // 数据转换器(清洗/格式化)
+│   ├── DataTransformer.java                    // 数据转换器(清洗/格式化, 内部调用 CharTransformer)
+│   ├── CharTransformer.java                    // ★ 字符转换引擎(三级规则合并+有序管道执行)
 │   ├── CategoryMapper.java                     // 品类映射处理器
 │   ├── PriceMatcher.java                       // 价格→库存匹配器
 │   └── DataValidator.java                      // 数据校验器
@@ -440,6 +640,8 @@ com.eiss.erp.defineimport
 │   │   ├── ImportTemplateField.java
 │   │   ├── ImportTemplateCategoryMapping.java
 │   │   ├── ImportTemplatePriceMatchRule.java
+│   │   ├── ImportCharRulePreset.java            // 系统预置字符转换规则
+│   │   ├── ImportTemplateCharRule.java          // 模板字符转换规则
 │   │   └── ImportRecord.java
 │   │
 │   ├── dto/                                     // 数据传输对象
@@ -471,7 +673,8 @@ com.eiss.erp.defineimport
 │   │   ├── FixedValueSourceConfig.java
 │   │   ├── CompositeSourceConfig.java
 │   │   ├── ColumnHeaderSourceConfig.java
-│   │   └── TransformConfig.java
+│   │   ├── TransformConfig.java
+│   │   └── CharTransformConfig.java             // 字符转换配置(含 fieldRules, excludePresetCodes等)
 │   │
 │   └── enums/
 │       ├── ContentTypeEnum.java                // INVENTORY(1), PRICE(2)
@@ -487,6 +690,8 @@ com.eiss.erp.defineimport
 │   ├── ImportTemplateFieldMapper.java
 │   ├── ImportTemplateCategoryMappingMapper.java
 │   ├── ImportTemplatePriceMatchRuleMapper.java
+│   ├── ImportCharRulePresetMapper.java          // 系统预置字符规则 Mapper
+│   ├── ImportTemplateCharRuleMapper.java        // 模板字符规则 Mapper
 │   └── ImportRecordMapper.java
 │
 └── util/
@@ -640,6 +845,58 @@ com.eiss.erp.defineimport
   - 错误不中断解析, 继续处理后续行
 ```
 
+#### CharTransformer（字符转换引擎）★ v1.1 新增
+
+```
+职责: 基于三级规则(系统预置/模板级/字段级)合并后, 对字段原始值进行有序的字符转换
+
+核心方法:
+  - buildPipeline(templateId, fieldCode, charTransformConfig)
+      → 构建当前字段的转换规则管道(初始化时调用一次, 缓存复用)
+  - transform(rawValue, pipeline)
+      → 按管道顺序逐条执行转换, 返回标准化后的字符串
+
+管道构建算法:
+  1. 收集系统预置规则:
+     a. 根据 charTransformConfig.usePresetGroups 筛选分组
+     b. 若 usePresetGroups 为空, 根据 fieldCode 自动推断:
+        - spec/wall_thickness → ["SPEC", "COMMON"]
+        - 其他文本字段 → ["COMMON"]
+     c. 排除 excludePresetCodes 中列出的规则
+  2. 收集模板级规则:
+     a. 若 charTransformConfig.useTemplateRules = true
+     b. 从 import_template_char_rule 表加载当前模板的规则
+     c. 按 apply_field_codes 过滤(null = 适用所有字段)
+     d. 若规则引用了 preset_rule_id, 从预置表获取实际配置
+  3. 收集字段级规则:
+     a. 从 charTransformConfig.fieldRules 数组
+  4. 合并去重:
+     a. 若同一 matchPattern 在多级都有定义, 字段级 > 模板级 > 系统级
+  5. 按 sort_order 升序排列 → 输出为 List<CharRule>
+
+单条规则执行逻辑:
+  LITERAL:
+    → String.replace(matchPattern, replaceValue)
+  REGEX:
+    → Pattern.compile(matchPattern).matcher(value).replaceAll(replaceValue)
+    → Pattern 预编译并缓存, 避免重复编译
+  FULLWIDTH:
+    → 遍历字符, 若在全角范围(0xFF01-0xFF5E)则偏移0xFEE0转半角
+    → 特殊处理: 全角空格(0x3000)→半角空格(0x20)
+  CHARCLASS:
+    → 与 REGEX 类似, 但 matchPattern 直接作为字符类 [...]
+
+性能优化:
+  - pipeline 按 (templateId, fieldCode) 缓存, 整个模板生命周期内只构建一次
+  - REGEX 类型的 Pattern 预编译并缓存
+  - LITERAL 类型使用 String.replace() (JDK内部已优化)
+  - 空 pipeline (无规则) 直接返回原值, 零开销
+
+错误处理:
+  - 正则编译失败 → 记录 WARNING 日志, 跳过该规则, 不中断
+  - 转换后值为空 → 保留空字符串(不回退到原值, 因为可能是有意为之)
+```
+
 ### 5.3 关键数据流
 
 ```
@@ -666,7 +923,13 @@ com.eiss.erp.defineimport
                                  ▼
               ┌──────────────────────────────────────┐
               │       DataTransformer                │
-              │  (去空格/去单位/数值转换/区间解析)      │
+              │  (去空格/字符转换/去单位/数值/区间)     │
+              │         ↓ 内部调用                    │
+              │  ┌──────────────────────────────┐    │
+              │  │     CharTransformer           │    │
+              │  │  (三级规则合并+有序管道)        │    │
+              │  │  ×→* / Φ→清除 / 全角→半角...  │    │
+              │  └──────────────────────────────┘    │
               └──────────────────┬───────────────────┘
                                  │
                                  ▼
@@ -790,6 +1053,64 @@ com.eiss.erp.defineimport
 | GET | `/api/v1/import-template/page` | 分页查询模板列表 |
 | GET | `/api/v1/import-template/list` | 查询指定供应商的可用模板 |
 
+### 6.2.1 字符转换规则接口
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/v1/char-rule-preset/list` | 查询所有系统预置规则(按分组) |
+| POST | `/api/v1/char-rule-preset/test` | 测试预置规则：输入样本值 → 输出转换结果 |
+| POST | `/api/v1/char-rule/test` | 测试自定义规则：输入规则 + 样本值 → 输出转换结果 |
+
+#### POST `/api/v1/char-rule-preset/test` — 规则测试
+
+**Request**:
+```json
+{
+    "sampleValues": ["50×100×2.0", "Φ219×6", "∅76×4.0", "200＊300", "10#"],
+    "presetGroups": ["SPEC", "COMMON"],
+    "excludePresetCodes": ["HASH_SIGN"],
+    "customRules": [
+        { "matchType": "LITERAL", "matchPattern": "﹡", "replaceValue": "*" }
+    ]
+}
+```
+
+**Response**:
+```json
+{
+    "code": 200,
+    "data": {
+        "results": [
+            {
+                "original": "50×100×2.0",
+                "transformed": "50*100*2.0",
+                "appliedRules": ["FULLWIDTH_STAR"]
+            },
+            {
+                "original": "Φ219×6",
+                "transformed": "219*6",
+                "appliedRules": ["PHI_UPPER", "FULLWIDTH_STAR"]
+            },
+            {
+                "original": "∅76×4.0",
+                "transformed": "76*4.0",
+                "appliedRules": ["DIAMETER_SIGN", "FULLWIDTH_STAR"]
+            },
+            {
+                "original": "200＊300",
+                "transformed": "200*300",
+                "appliedRules": ["custom_0"]
+            },
+            {
+                "original": "10#",
+                "transformed": "10#",
+                "appliedRules": []
+            }
+        ]
+    }
+}
+```
+
 #### POST `/api/v1/import-template` — 创建模板
 
 **Request**:
@@ -802,6 +1123,25 @@ com.eiss.erp.defineimport
     "scope": "唐钢月度库存报价",
     "allSheetsPrice": false,
     "remark": "唐钢标准格式",
+    "charRules": [
+        {
+            "applyFieldCodes": ["spec", "wall_thickness"],
+            "presetRuleId": null,
+            "matchType": "LITERAL",
+            "matchPattern": "﹡",
+            "replaceValue": "*",
+            "description": "小型星号(U+FF0A)转标准星号",
+            "sortOrder": 15,
+            "enabled": true
+        },
+        {
+            "applyFieldCodes": null,
+            "presetRuleId": 1,
+            "description": "引用系统预置: 全角×→半角*",
+            "sortOrder": 10,
+            "enabled": true
+        }
+    ],
     "sheets": [
         {
             "sheetIndex": 0,
@@ -839,10 +1179,12 @@ com.eiss.erp.defineimport
                             },
                             "transformConfig": {
                                 "trimWhitespace": true,
-                                "replacements": [
-                                    { "from": "×", "to": "*" },
-                                    { "from": "Φ", "to": "" }
-                                ]
+                                "charTransform": {
+                                    "useTemplateRules": true,
+                                    "usePresetGroups": ["SPEC", "COMMON"],
+                                    "fieldRules": [],
+                                    "excludePresetCodes": ["HASH_SIGN"]
+                                }
                             },
                             "required": true
                         },
@@ -1066,6 +1408,9 @@ src/
 │   │   ├── FieldMappingList.vue              // 字段映射列表
 │   │   ├── FieldMappingForm.vue              // 单字段映射编辑
 │   │   ├── SourceConfigEditor.vue            // 数据来源配置编辑器
+│   │   ├── CharRuleEditor.vue                // ★ 字符转换规则编辑器
+│   │   ├── CharRulePresetPicker.vue          // ★ 系统预置规则选择器
+│   │   ├── CharRuleTestPanel.vue             // ★ 字符转换规则测试面板
 │   │   ├── CategoryMappingEditor.vue         // 品类映射规则编辑
 │   │   └── PriceMatchRuleForm.vue            // 价格匹配规则
 │   │
@@ -1122,10 +1467,19 @@ src/
 │  │  │  │# │郸│35│  │2 │  │  │  │  │ ☐ 重量   来源: [F列]  ✎   ││  │
 │  │  │  │14│  │  │6 │15│  │  │  │  └────────────────────────────┘│  │
 │  │  │  │# │  │  │  │.0│  │  │  │                                │  │
-│  │  ├──┼──┼──┼──┼──┼──┼──┤  │  │  品类映射规则 [+ 新增]          │  │
-│  │  │角│50│天│Q3│12│20│  │  │  │  (当品类需要派生时配置)          │  │
-│  │  │钢│*5│津│55│  │.0│  │  │  │                                │  │
-│  │  └──┴──┴──┴──┴──┴──┴──┘  │  │  价格匹配规则                   │  │
+│  │  ├──┼──┼──┼──┼──┼──┼──┤  │  │  字符转换规则 ★                 │  │
+│  │  │角│50│天│Q3│12│20│  │  │  │  ┌──────────────────────────┐  │  │
+│  │  │钢│*5│津│55│  │.0│  │  │  │  │预置: ☑SPEC ☑COMMON     │  │  │
+│  │  └──┴──┴──┴──┴──┴──┴──┘  │  │  │排除: ☐HASH_SIGN        │  │  │
+│  │                            │  │  │自定义: [+新增]          │  │  │
+│  │                            │  │  │ ﹡→* ㎜→mm             │  │  │
+│  │                            │  │  │[测试] Φ219×6 → 219*6   │  │  │
+│  │                            │  │  └──────────────────────────┘  │  │
+│  │                            │  │                                │  │
+│  │                            │  │  品类映射规则 [+ 新增]          │  │
+│  │                            │  │  (当品类需要派生时配置)          │  │
+│  │                            │  │                                │  │
+│  │                            │  │  价格匹配规则                   │  │
 │  │                            │  │  (仅价格类型Sheet显示)          │  │
 │  │  点击单元格 → 右侧显示定位   │  │                                │  │
 │  └────────────────────────────┘  └────────────────────────────────┘  │
@@ -1168,6 +1522,56 @@ src/
    - 目标品类: [镀锌方管]  (系统中的标准品类名)
 4. 可添加多条映射规则
 5. 预览: 根据当前 Excel 数据实时展示映射结果
+```
+
+#### 字符转换规则配置交互 ★ v1.1 新增
+
+```
+一、模板级规则配置（适用于当前模板所有字段或指定字段）
+
+1. 在配置面板顶部展开「字符转换规则」折叠区域
+2. 「系统预置规则」区域:
+   a. 分组显示所有预置规则: SPEC(规格专用) / COMMON(通用)
+   b. 每条预置规则显示: 规则名称 + 匹配→替换 + 启用开关
+   c. 用户可逐条启用/禁用(对应 excludePresetCodes)
+   d. 特殊标记: 规格字段默认启用 SPEC+COMMON 组, 其他字段默认只启用 COMMON 组
+3. 「模板自定义规则」区域:
+   a. 点击 [+ 新增规则], 弹出规则编辑表单:
+      - 匹配方式: [精确字符 ▼] (LITERAL/REGEX/FULLWIDTH/CHARCLASS)
+      - 匹配内容: [﹡]
+      - 替换为:   [*]  (留空 = 删除该字符)
+      - 适用字段: [全部 ▼] / [规格, 壁厚]  (多选)
+      - 执行顺序: [15]
+      - 说明:     [小型星号转标准星号]
+   b. 已添加的规则以列表展示, 支持拖拽排序、编辑、删除
+
+二、字段级规则配置（在单字段映射编辑中）
+
+1. 用户编辑某个字段(如"规格")的映射规则时
+2. 在「数据转换」区域展开「字符转换」子项:
+   a. ☑ 使用模板级规则 (useTemplateRules, 默认勾选)
+   b. 预置规则分组: [SPEC, COMMON ▼]  (usePresetGroups)
+   c. 排除预置规则: [HASH_SIGN ▼]  (多选, excludePresetCodes)
+   d. 字段专属规则: [+ 新增]  (fieldRules, 仅对当前字段生效)
+
+三、实时测试功能
+
+1. 在字符转换规则区域底部有 [测试转换] 按钮
+2. 点击后弹出测试面板:
+   a. 左侧: 输入框, 可手动输入或从当前 Excel 中选取样本值
+   b. 右侧: 实时显示转换结果
+   c. 下方: 显示命中的规则列表(哪些规则被触发)
+3. 支持批量测试: 从当前 Sheet 的规格列自动提取前 20 个不重复值作为样本
+4. 测试结果示例:
+   ┌─────────────┬──────────────┬─────────────────────┐
+   │ 原始值       │ 转换后        │ 命中规则             │
+   ├─────────────┼──────────────┼─────────────────────┤
+   │ 50×100×2.0  │ 50*100*2.0   │ FULLWIDTH_STAR      │
+   │ Φ219×6      │ 219*6        │ PHI_UPPER, F_STAR   │
+   │ ∅76×4.0     │ 76*4.0       │ DIAMETER_SIGN, F_S  │
+   │ 10#         │ 10#          │ (无命中,#已排除)     │
+   │ 200＊300     │ 200*300      │ 模板自定义_﹡→*      │
+   └─────────────┴──────────────┴─────────────────────┘
 ```
 
 ---
@@ -1250,8 +1654,9 @@ public class DynamicExcelListener extends AnalysisEventListener<Map<Integer, Cel
                 field, rowData, headerColumnMap, mergeCellMap, fixedCellCache, rowIndex
             );
 
-            // 数据转换
-            String cleanValue = DataTransformer.transform(rawValue, field.getTransformConfig());
+            // 数据转换(内含字符转换管道: 系统预置→模板级→字段级规则按序执行)
+            String cleanValue = DataTransformer.transform(rawValue, field.getTransformConfig(),
+                charTransformPipelineCache.get(field.getFieldCode()));
 
             // 品类映射
             if ("category".equals(field.getFieldCode()) && group.getCategoryMappings() != null) {
@@ -1437,6 +1842,41 @@ public class ExcelImportError {
 2. 从价格壁厚范围 "0.5-1.0" 解析 min=0.5, max=1.0
 3. 0.5 ≤ 0.8 ≤ 1.0 → 匹配成功, price=4200
 
+### 场景 5：规格特殊符号转换 ★ v1.1 新增
+
+**Excel 原始数据**（某供应商的库存表）:
+```
+| A(品类) | B(规格)       | C(产地) | D(重量) |
+|---------|--------------|---------|---------|
+| 方管    | 50×100×2.0   | 唐山    | 12.5    |
+| 圆管    | Φ219×6       | 邯郸    | 9.2     |
+| 圆管    | ∅76×4.0      | 天津    | 15.0    |
+| 方管    | ２００＊３００   | 唐山    | 20.0    |
+| 槽钢    | 10#          | 邯郸    | 8.5     |
+| 角钢    | 50*5  （热轧） | 天津    | 6.0     |
+```
+
+**模板配置要点**:
+- spec 字段的 charTransform:
+  - usePresetGroups: ["SPEC", "COMMON"]
+  - excludePresetCodes: ["HASH_SIGN"]（保留#号，因为10#是标准型号名称）
+- 模板级自定义规则：无额外规则（系统预置已覆盖）
+
+**字符转换执行过程**:
+
+```
+原始值                → Step1 trimWhitespace  → Step2 charTransform          → 最终值
+─────────────────────────────────────────────────────────────────────────────────────
+50×100×2.0           → 50×100×2.0            → 50*100*2.0  (×→*)           → 50*100*2.0
+Φ219×6               → Φ219×6               → 219*6       (Φ删,×→*)      → 219*6
+∅76×4.0              → ∅76×4.0              → 76*4.0      (∅删,×→*)      → 76*4.0
+２００＊３００          → ２００＊３００         → 200*300     (全角数字→半角, ＊→*) → 200*300
+10#                  → 10#                  → 10#         (#已排除)       → 10#
+50*5  （热轧）        → 50*5  （热轧）        → 50*5 (热轧) (全角括号→半角, 多空格→单空格) → 50*5 (热轧)
+```
+
+**解析结果**: 6 行库存数据，规格全部归一化为标准格式。
+
 ---
 
 ## 十二、安全与健壮性设计
@@ -1497,7 +1937,9 @@ public class SafeConvertUtil {
 |-------|---------|
 | `HeaderMatcherTest` | 各种别名匹配、大小写、全半角、空格 |
 | `FieldValueResolverTest` | 5种 source_type 的取值正确性 |
-| `DataTransformerTest` | 去空格、去单位、数值精度、区间解析 |
+| `DataTransformerTest` | 去空格、去单位、数值精度、区间解析、字符转换管道集成 |
+| `CharTransformerTest` | ★ 三级规则合并、sort_order排序、四种matchType、excludePresetCodes、pipeline缓存、正则异常容错、全角转半角批量、空pipeline快速路径 |
+| `CharRulePresetTest` | ★ 系统预置规则覆盖率: 所有INSERT初始数据的正确性验证 |
 | `CategoryMapperTest` | 品类映射命中/未命中/通配 |
 | `PriceMatcherTest` | 精确匹配、壁厚区间匹配 |
 | `MergeCellCollectorTest` | 合并区域填充、边界条件 |
@@ -1523,6 +1965,9 @@ public class SafeConvertUtil {
 | 超大文件（>10万行） | 内存占用过高 | 批量flush + 限制单文件最大行数 |
 | source_config JSON 结构变更 | 历史模板不兼容 | JSON 中增加 version 字段, 解析时做版本兼容 |
 | 品类映射规则过于复杂 | 运营难以配置 | 提供"规则测试"功能: 输入样本值, 实时显示映射结果 |
+| 正则表达式书写错误 | 字符转换规则报错或死循环(ReDOS) | 后端正则预编译时 try-catch + 超时保护; 前端提供下拉预设降低手写正则频率 |
+| 字符转换规则冲突/顺序问题 | 先替换的字符影响后续规则匹配 | 严格按 sort_order 执行 + 测试面板实时显示每步中间结果 |
+| 新出现的特殊符号未覆盖 | 导入后规格不标准, 影响价格匹配 | 系统预置规则可由管理员在线新增, 无需发版 |
 
 ---
 
