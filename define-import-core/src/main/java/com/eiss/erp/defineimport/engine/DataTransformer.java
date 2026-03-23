@@ -2,6 +2,7 @@ package com.eiss.erp.defineimport.engine;
 
 import com.eiss.erp.defineimport.model.config.CharTransformConfig;
 import com.eiss.erp.defineimport.model.config.TransformConfig;
+import com.eiss.erp.defineimport.util.RegexSafeUtil;
 import com.eiss.erp.defineimport.util.SafeConvertUtil;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.DeserializationFeature;
@@ -12,7 +13,6 @@ import org.slf4j.LoggerFactory;
 import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
-import java.util.regex.PatternSyntaxException;
 
 /**
  * 数据转换器
@@ -98,20 +98,19 @@ public class DataTransformer {
      * 若正则无捕获组则返回整个匹配结果；若不匹配则返回原值。
      */
     private static String applyRegexExtract(String value, String regex) {
-        try {
-            Pattern pattern = Pattern.compile(regex);
-            Matcher matcher = pattern.matcher(value);
-            if (matcher.find()) {
-                // 优先取第一个捕获组
-                if (matcher.groupCount() >= 1) {
-                    String group = matcher.group(1);
-                    return group != null ? group : value;
-                }
-                // 无捕获组时返回整个匹配
-                return matcher.group();
+        Pattern pattern = RegexSafeUtil.safeCompile(regex, log);
+        if (pattern == null) {
+            return value;
+        }
+        Matcher matcher = pattern.matcher(value);
+        if (matcher.find()) {
+            // 优先取第一个捕获组
+            if (matcher.groupCount() >= 1) {
+                String group = matcher.group(1);
+                return group != null ? group : value;
             }
-        } catch (PatternSyntaxException e) {
-            log.warn("regexExtract 正则编译失败: {}, 原因: {}", regex, e.getMessage());
+            // 无捕获组时返回整个匹配
+            return matcher.group();
         }
         return value;
     }

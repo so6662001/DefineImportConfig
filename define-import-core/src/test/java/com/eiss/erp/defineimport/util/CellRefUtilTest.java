@@ -3,6 +3,7 @@ package com.eiss.erp.defineimport.util;
 import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class CellRefUtilTest {
 
@@ -49,5 +50,22 @@ class CellRefUtilTest {
     void shouldHandleLowercaseInput() {
         assertThat(CellRefUtil.getColIndex("aa1")).isEqualTo(26);
         assertThat(CellRefUtil.getRowIndex("aa10")).isEqualTo(9);
+    }
+
+    @Test
+    void shouldReturnNegativeOneForInvalidCellRef() {
+        assertThat(CellRefUtil.getRowIndex(null)).isEqualTo(-1);
+        assertThat(CellRefUtil.getColIndex("")).isEqualTo(-1);
+        assertThat(CellRefUtil.getRowIndex("invalid")).isEqualTo(-1);
+        assertThat(CellRefUtil.getColIndex("A0")).isEqualTo(-1);
+    }
+
+    @Test
+    void toRefShouldRejectNegativeIndices() {
+        assertThatThrownBy(() -> CellRefUtil.toRef(-1, 0))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("non-negative");
+        assertThatThrownBy(() -> CellRefUtil.toRef(0, -1))
+                .isInstanceOf(IllegalArgumentException.class);
     }
 }

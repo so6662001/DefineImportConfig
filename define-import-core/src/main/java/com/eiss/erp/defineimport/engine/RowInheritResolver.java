@@ -1,12 +1,15 @@
 package com.eiss.erp.defineimport.engine;
 
 import com.eiss.erp.defineimport.model.config.RowInheritConfig;
+import com.eiss.erp.defineimport.util.RegexSafeUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
-import java.util.regex.PatternSyntaxException;
+import java.util.Set;
+import java.util.regex.Pattern;
 
 /**
  * 行间继承解析器
@@ -33,6 +36,11 @@ public class RowInheritResolver {
      */
     private final Map<String, String> prevPrefixMap = new HashMap<>();
 
+    /** 已成功编译的 partialPattern */
+    private final Map<String, Pattern> partialPatternCache = new HashMap<>();
+    /** 编译失败过的 partialPattern，避免重复日志与重复尝试 */
+    private final Set<String> failedPartialPatterns = new HashSet<>();
+
     /**
      * 对当前值进行行间继承处理。
      *
@@ -54,13 +62,12 @@ public class RowInheritResolver {
             return currentValue;
         }
 
-        boolean isPartial;
-        try {
-            isPartial = currentValue.matches(partialPattern);
-        } catch (PatternSyntaxException e) {
-            log.warn("partialPattern 正则语法错误: {}, fieldCode={}", partialPattern, fieldCode);
+        Pattern compiled = getPartialPattern(partialPattern);
+        if (compiled == null) {
             return currentValue;
         }
+
+        boolean isPartial = compiled.matcher(currentValue).matches();
 
         if (!isPartial) {
             // 当前值是完整值，更新前缀缓存
@@ -100,5 +107,24 @@ public class RowInheritResolver {
      */
     public void reset() {
         prevPrefixMap.clear();
+        partialPatternCache.clear();
+        failedPartialPatterns.clear();
+    }
+
+    private Pattern getPartialPattern(String partialPattern) {
+        Pattern cached = partialPatternCache.get(partialPattern);
+        if (cached != null) {
+            return cached;
+        }
+        if (failedPartialPatterns.contains(partialPattern)) {
+            return null;
+        }
+        Pattern p = RegexSafeUtil.safeCompile(partialPattern, log);
+        if (p == null) {
+            failedPartialPatterns.add(partialPattern);
+            return null;
+        }
+        partialPatternCache.put(partialPattern, p);
+        return p;
     }
 }

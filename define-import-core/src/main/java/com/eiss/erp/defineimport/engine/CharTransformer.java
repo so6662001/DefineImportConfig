@@ -1,13 +1,12 @@
 package com.eiss.erp.defineimport.engine;
 
 import com.eiss.erp.defineimport.model.config.CharTransformConfig;
+import com.eiss.erp.defineimport.util.RegexSafeUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Pattern;
-import java.util.regex.PatternSyntaxException;
 
 /**
  * 字符转换引擎
@@ -25,10 +24,18 @@ public class CharTransformer {
 
     private static final Logger log = LoggerFactory.getLogger(CharTransformer.class);
 
+    private static final int MAX_PATTERN_CACHE = 500;
+
     /**
-     * 编译后的正则缓存，避免重复编译
+     * 编译后的正则缓存（LRU，最多 {@link #MAX_PATTERN_CACHE} 条）
      */
-    private static final Map<String, Pattern> PATTERN_CACHE = new ConcurrentHashMap<>();
+    private static final Object PATTERN_CACHE_LOCK = new Object();
+    private static final Map<String, Pattern> PATTERN_CACHE = new LinkedHashMap<String, Pattern>(16, 0.75f, true) {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<String, Pattern> eldest) {
+            return size() > MAX_PATTERN_CACHE;
+        }
+    };
 
     private CharTransformer() {
     }
@@ -148,14 +155,27 @@ public class CharTransformer {
      * 获取或编译正则表达式，编译失败时记录警告并返回 null
      */
     private static Pattern getOrCompilePattern(String regex) {
-        return PATTERN_CACHE.computeIfAbsent(regex, k -> {
-            try {
-                return Pattern.compile(k);
-            } catch (PatternSyntaxException e) {
-                log.warn("正则表达式编译失败: {}, 原因: {}", k, e.getMessage());
-                return null;
+        if (regex == null || regex.isEmpty()) {
+            return null;
+        }
+        synchronized (PATTERN_CACHE_LOCK) {
+            Pattern existing = PATTERN_CACHE.get(regex);
+            if (existing != null) {
+                return existing;
             }
-        });
+        }
+        Pattern compiled = RegexSafeUtil.safeCompile(regex, log);
+        if (compiled == null) {
+            return null;
+        }
+        synchronized (PATTERN_CACHE_LOCK) {
+            Pattern again = PATTERN_CACHE.get(regex);
+            if (again != null) {
+                return again;
+            }
+            PATTERN_CACHE.put(regex, compiled);
+            return compiled;
+        }
     }
 
     /**
@@ -190,8 +210,8 @@ public class CharTransformer {
                 if (rule == null) {
                     continue;
                 }
-                // 如果规则的描述或matchPattern在排除列表中则跳过
-                if (rule.getDescription() != null && excludeCodes.contains(rule.getDescription())) {
+                String ruleCode = rule.getRuleCode();
+                if (ruleCode != null && excludeCodes.contains(ruleCode)) {
                     continue;
                 }
                 pipeline.add(rule);

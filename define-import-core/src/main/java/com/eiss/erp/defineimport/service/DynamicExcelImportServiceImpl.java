@@ -139,6 +139,7 @@ public class DynamicExcelImportServiceImpl implements DynamicExcelImportService 
             r.setReplaceValue(p.getReplaceValue());
             r.setSortOrder(p.getSortOrder());
             r.setDescription(p.getDescription());
+            r.setRuleCode(p.getRuleCode());
             rules.add(r);
         }
         return rules;

@@ -155,7 +155,7 @@ public class DynamicExcelListener extends AnalysisEventListener<Map<Integer, Str
             String transformedValue = DataTransformer.transform(
                     rawValue, field.getTransformConfig(), pipeline);
 
-            TransformConfig tc = parseTransformConfig(field.getTransformConfig());
+            TransformConfig tc = parseTransformConfig(field.getTransformConfig(), field.getFieldCode());
             if (tc != null && tc.getRowInherit() != null) {
                 transformedValue = rowInheritResolver.resolve(
                         field.getFieldCode(), transformedValue, tc.getRowInherit());
@@ -218,7 +218,9 @@ public class DynamicExcelListener extends AnalysisEventListener<Map<Integer, Str
                             return headerText.trim();
                         }
                     }
-                } catch (Exception ignored) {
+                } catch (Exception e) {
+                    log.warn("解析 COLUMN_HEADER 的 sourceConfig 失败, fieldCode={}: {}",
+                            field.getFieldCode(), e.getMessage());
                 }
             }
         }
@@ -253,13 +255,14 @@ public class DynamicExcelListener extends AnalysisEventListener<Map<Integer, Str
         return true;
     }
 
-    private TransformConfig parseTransformConfig(String json) {
+    private TransformConfig parseTransformConfig(String json, String fieldCode) {
         if (json == null || json.isBlank()) {
             return null;
         }
         try {
             return OBJECT_MAPPER.readValue(json, TransformConfig.class);
         } catch (Exception e) {
+            log.warn("解析 TransformConfig JSON 失败, fieldCode={}: {}", fieldCode, e.getMessage());
             return null;
         }
     }

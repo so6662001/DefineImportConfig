@@ -159,6 +159,9 @@ public class FieldValueResolver {
         if (config.getCellRef() != null && !config.getCellRef().isBlank()) {
             row = CellRefUtil.getRowIndex(config.getCellRef());
             col = CellRefUtil.getColIndex(config.getCellRef());
+            if (row < 0 || col < 0) {
+                return null;
+            }
         } else if (config.getRow() != null && config.getCol() != null) {
             row = config.getRow();
             col = config.getCol();
@@ -286,6 +289,9 @@ public class FieldValueResolver {
                 if (part.getCellRef() != null && !part.getCellRef().isBlank()) {
                     row = CellRefUtil.getRowIndex(part.getCellRef());
                     col = CellRefUtil.getColIndex(part.getCellRef());
+                    if (row < 0 || col < 0) {
+                        return null;
+                    }
                 } else if (part.getRow() != null && part.getCol() != null) {
                     row = part.getRow();
                     col = part.getCol();

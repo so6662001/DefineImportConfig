@@ -2,6 +2,9 @@ package com.eiss.erp.defineimport.engine;
 
 import com.eiss.erp.defineimport.model.config.SpecRangeConfig;
 import com.eiss.erp.defineimport.util.RangeUtil;
+import com.eiss.erp.defineimport.util.RegexSafeUtil;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -17,6 +20,8 @@ import java.util.regex.Pattern;
  * </p>
  */
 public class SpecRangeParser {
+
+    private static final Logger log = LoggerFactory.getLogger(SpecRangeParser.class);
 
     /** 默认区间后缀正则：匹配末尾中/英文括号 */
     private static final String DEFAULT_RANGE_PATTERN = "[（(]([^）)]+)[）)]\\s*$";
@@ -52,7 +57,10 @@ public class SpecRangeParser {
             pattern = DEFAULT_RANGE_PATTERN;
         }
 
-        Pattern p = Pattern.compile(pattern);
+        Pattern p = RegexSafeUtil.safeCompile(pattern, log);
+        if (p == null) {
+            p = Pattern.compile(DEFAULT_RANGE_PATTERN);
+        }
         Matcher m = p.matcher(specValue);
         if (m.find()) {
             String rangeText = m.group(1);

@@ -26,5 +26,7 @@ public class CharTransformConfig {
         private String applyFieldCodes;
         /** When set, match/replace may be resolved from import_char_rule_preset at load time. */
         private Long presetRuleId;
+        /** Stable code for preset rules (e.g. from import_char_rule_preset.rule_code); used for excludePresetCodes. */
+        private String ruleCode;
     }
 }

@@ -480,6 +480,7 @@ public class ImportTemplateServiceImpl implements ImportTemplateService {
                 rule.setMatchType(preset.getMatchType());
                 rule.setMatchPattern(preset.getMatchPattern());
                 rule.setReplaceValue(preset.getReplaceValue());
+                rule.setRuleCode(preset.getRuleCode());
             } else {
                 rule.setMatchType(entity.getMatchType());
                 rule.setMatchPattern(entity.getMatchPattern());

@@ -73,7 +73,7 @@ class CharTransformerTest {
     @Test
     void shouldBuildPipelineWithExclusions() {
         CharTransformConfig.CharRule preset = rule("LITERAL", "x", "y", 1);
-        preset.setDescription("RULE_TO_EXCLUDE");
+        preset.setRuleCode("RULE_TO_EXCLUDE");
 
         CharTransformConfig fieldConfig = new CharTransformConfig();
         fieldConfig.setExcludePresetCodes(List.of("RULE_TO_EXCLUDE"));

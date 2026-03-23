@@ -92,10 +92,11 @@ public class DynamicExcelParser {
                                       ContentTypeEnum contentTypeFilter) {
         byte[] fileBytes = toByteArray(inputStream);
 
-        List<SheetConfigDto> sheets = templateDto.getSheets();
-        if (sheets == null || sheets.isEmpty()) {
+        if (templateDto.getSheets() == null || templateDto.getSheets().isEmpty()) {
             return buildEmptyResult(templateDto.getTemplateName());
         }
+
+        List<SheetConfigDto> sheets = new ArrayList<>(templateDto.getSheets());
 
         Comparator<SheetConfigDto> bySortOrder = Comparator.comparingInt(
                 s -> s.getSortOrder() != null ? s.getSortOrder() : Integer.MAX_VALUE);
@@ -290,7 +291,9 @@ public class DynamicExcelParser {
                         var tc = OBJECT_MAPPER.readValue(field.getTransformConfig(),
                                 com.eiss.erp.defineimport.model.config.TransformConfig.class);
                         fieldCharConfig = tc.getCharTransform();
-                    } catch (Exception ignored) {
+                    } catch (Exception e) {
+                        log.warn("解析字段 transformConfig 中的 CharTransform 失败, fieldCode={}: {}",
+                                field.getFieldCode(), e.getMessage());
                     }
                 }
                 List<CharTransformConfig.CharRule> templateRulesForField =
