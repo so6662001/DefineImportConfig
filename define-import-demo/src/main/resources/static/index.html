@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>钢贸动态Excel导入系统 - Demo</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/element-plus@2.7.0/dist/index.css">
+    <script src="https://cdn.jsdelivr.net/npm/vue@3.4.21/dist/vue.global.prod.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/element-plus@2.7.0/dist/index.full.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/element-plus@2.7.0/dist/locale/zh-cn.min.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f0f2f5; }
+        .app-header { background: linear-gradient(135deg, #1a237e, #283593); color: #fff; padding: 16px 32px; }
+        .app-header h1 { font-size: 20px; font-weight: 600; }
+        .app-header p { font-size: 13px; opacity: 0.8; margin-top: 4px; }
+        .main-container { max-width: 1400px; margin: 20px auto; padding: 0 20px; }
+        .json-editor { font-family: 'Consolas', 'Monaco', monospace; font-size: 13px; }
+        .preview-table { margin-top: 16px; }
+        .el-table .cell { font-size: 13px; }
+        .stat-cards { display: flex; gap: 16px; margin-bottom: 16px; flex-wrap: wrap; }
+        .stat-card { background: #fff; border-radius: 8px; padding: 16px 24px; flex: 1; min-width: 150px;
+                     box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+        .stat-card .label { font-size: 13px; color: #909399; }
+        .stat-card .value { font-size: 28px; font-weight: 700; color: #303133; margin-top: 4px; }
+        .stat-card .value.success { color: #67c23a; }
+        .stat-card .value.danger { color: #f56c6c; }
+        .stat-card .value.primary { color: #409eff; }
+    </style>
+</head>
+<body>
+<div id="app">
+    <div class="app-header">
+        <h1>钢贸动态 Excel 导入系统</h1>
+        <p>基于动态映射规则的 Excel 导入服务 Demo</p>
+    </div>
+    <div class="main-container">
+        <el-tabs v-model="activeTab" type="border-card">
+            <!-- 模板管理 -->
+            <el-tab-pane label="模板管理" name="template">
+                <el-row :gutter="20">
+                    <el-col :span="10">
+                        <el-card shadow="hover">
+                            <template #header>
+                                <div style="display:flex;justify-content:space-between;align-items:center">
+                                    <span>创建/编辑模板</span>
+                                    <el-button type="primary" size="small" @click="createTemplate" :loading="creating">保存模板</el-button>
+                                </div>
+                            </template>
+                            <el-input type="textarea" v-model="templateJson" :rows="28" class="json-editor"
+                                      placeholder="输入模板 JSON 配置..."></el-input>
+                            <el-button style="margin-top:8px" size="small" @click="loadSampleTemplate">加载示例</el-button>
+                        </el-card>
+                    </el-col>
+                    <el-col :span="14">
+                        <el-card shadow="hover">
+                            <template #header>
+                                <div style="display:flex;justify-content:space-between;align-items:center">
+                                    <span>模板列表</span>
+                                    <el-button size="small" @click="loadTemplates" :loading="loadingTemplates">刷新</el-button>
+                                </div>
+                            </template>
+                            <el-table :data="templates" stripe size="small" max-height="500">
+                                <el-table-column prop="id" label="ID" width="60"></el-table-column>
+                                <el-table-column prop="templateCode" label="模板编号" width="140"></el-table-column>
+                                <el-table-column prop="templateName" label="模板名称" min-width="160"></el-table-column>
+                                <el-table-column prop="supplierName" label="供应商" width="120"></el-table-column>
+                                <el-table-column prop="status" label="状态" width="70">
+                                    <template #default="{row}">
+                                        <el-tag :type="row.status===1?'success':'info'" size="small">{{row.status===1?'启用':'禁用'}}</el-tag>
+                                    </template>
+                                </el-table-column>
+                                <el-table-column label="操作" width="140">
+                                    <template #default="{row}">
+                                        <el-button link type="primary" size="small" @click="viewTemplate(row.id)">查看</el-button>
+                                        <el-popconfirm title="确定删除?" @confirm="deleteTemplate(row.id)">
+                                            <template #reference>
+                                                <el-button link type="danger" size="small">删除</el-button>
+                                            </template>
+                                        </el-popconfirm>
+                                    </template>
+                                </el-table-column>
+                            </el-table>
+                        </el-card>
+                        <el-card shadow="hover" style="margin-top:16px" v-if="viewingTemplate">
+                            <template #header><span>模板详情 #{{viewingTemplate.template?.id}}</span></template>
+                            <el-input type="textarea" :model-value="JSON.stringify(viewingTemplate, null, 2)"
+                                      :rows="16" class="json-editor" readonly></el-input>
+                        </el-card>
+                    </el-col>
+                </el-row>
+            </el-tab-pane>
+
+            <!-- 导入测试 -->
+            <el-tab-pane label="导入测试" name="import">
+                <el-row :gutter="16" style="margin-bottom:16px">
+                    <el-col :span="8">
+                        <el-select v-model="importTemplateId" placeholder="选择模板" style="width:100%" @focus="loadTemplates">
+                            <el-option v-for="t in templates" :key="t.id" :label="t.templateName + ' (' + t.templateCode + ')'" :value="t.id"></el-option>
+                        </el-select>
+                    </el-col>
+                    <el-col :span="10">
+                        <el-upload ref="importUploadRef" :auto-upload="false" :limit="1" accept=".xlsx,.xls"
+                                   :on-change="onImportFileChange" :on-remove="()=>importFile=null">
+                            <template #trigger>
+                                <el-button type="info" plain>选择 Excel 文件</el-button>
+                            </template>
+                        </el-upload>
+                    </el-col>
+                    <el-col :span="6">
+                        <el-button type="primary" @click="doImportPreview" :loading="importing"
+                                   :disabled="!importTemplateId||!importFile">开始导入预览</el-button>
+                    </el-col>
+                </el-row>
+                <template v-if="importResult">
+                    <div class="stat-cards">
+                        <div class="stat-card"><div class="label">总行数</div><div class="value primary">{{importResult.summary?.totalRows||0}}</div></div>
+                        <div class="stat-card"><div class="label">库存行</div><div class="value">{{importResult.inventoryRows?.length||0}}</div></div>
+                        <div class="stat-card"><div class="label">价格行</div><div class="value">{{importResult.priceRows?.length||0}}</div></div>
+                        <div class="stat-card"><div class="label">成功</div><div class="value success">{{importResult.summary?.successRows||0}}</div></div>
+                        <div class="stat-card"><div class="label">错误</div><div class="value danger">{{importResult.errors?.length||0}}</div></div>
+                    </div>
+                    <el-tabs v-model="importViewTab">
+                        <el-tab-pane label="库存数据" name="inventory">
+                            <el-table :data="importResult.inventoryRows" stripe size="small" max-height="400" class="preview-table">
+                                <el-table-column prop="rowIndex" label="行号" width="60"></el-table-column>
+                                <el-table-column prop="sheetName" label="Sheet" width="100"></el-table-column>
+                                <el-table-column prop="groupName" label="分组" width="100"></el-table-column>
+                                <el-table-column prop="category" label="品类" width="100"></el-table-column>
+                                <el-table-column prop="spec" label="规格" width="120"></el-table-column>
+                                <el-table-column prop="origin" label="产地" width="100"></el-table-column>
+                                <el-table-column prop="material" label="材质" width="100"></el-table-column>
+                                <el-table-column prop="weight" label="重量" width="80"></el-table-column>
+                                <el-table-column prop="price" label="价格" width="80"></el-table-column>
+                                <el-table-column prop="remark" label="备注" min-width="120"></el-table-column>
+                            </el-table>
+                        </el-tab-pane>
+                        <el-tab-pane label="价格数据" name="price">
+                            <el-table :data="importResult.priceRows" stripe size="small" max-height="400" class="preview-table">
+                                <el-table-column prop="rowIndex" label="行号" width="60"></el-table-column>
+                                <el-table-column prop="category" label="品类" width="100"></el-table-column>
+                                <el-table-column prop="spec" label="规格" width="120"></el-table-column>
+                                <el-table-column prop="origin" label="产地" width="100"></el-table-column>
+                                <el-table-column prop="price" label="价格" width="100"></el-table-column>
+                            </el-table>
+                        </el-tab-pane>
+                        <el-tab-pane :label="'错误信息 ('+((importResult.errors||[]).length)+')'" name="errors">
+                            <el-table :data="importResult.errors" stripe size="small" max-height="400">
+                                <el-table-column prop="sheetName" label="Sheet" width="100"></el-table-column>
+                                <el-table-column prop="rowIndex" label="行号" width="60"></el-table-column>
+                                <el-table-column prop="fieldName" label="字段" width="120"></el-table-column>
+                                <el-table-column prop="errorMsg" label="错误信息" min-width="240"></el-table-column>
+                                <el-table-column prop="errorLevel" label="级别" width="80">
+                                    <template #default="{row}">
+                                        <el-tag :type="row.errorLevel==='ERROR'?'danger':'warning'" size="small">{{row.errorLevel}}</el-tag>
+                                    </template>
+                                </el-table-column>
+                            </el-table>
+                        </el-tab-pane>
+                    </el-tabs>
+                </template>
+            </el-tab-pane>
+
+            <!-- Excel预览 -->
+            <el-tab-pane label="Excel预览" name="preview">
+                <el-row :gutter="16" style="margin-bottom:16px">
+                    <el-col :span="16">
+                        <el-upload ref="previewUploadRef" :auto-upload="false" :limit="1" accept=".xlsx,.xls"
+                                   :on-change="onPreviewFileChange" :on-remove="()=>{previewFileObj=null;previewSheets=[];}">
+                            <template #trigger>
+                                <el-button type="info" plain>选择 Excel 文件</el-button>
+                            </template>
+                        </el-upload>
+                    </el-col>
+                    <el-col :span="8">
+                        <el-button type="primary" @click="doPreviewUpload" :loading="previewUploading"
+                                   :disabled="!previewFileObj">上传并解析</el-button>
+                    </el-col>
+                </el-row>
+                <template v-if="previewSheets.length">
+                    <el-alert :title="'文件: '+previewFileName+' | 共 '+previewSheets.length+' 个Sheet'"
+                              type="info" :closable="false" style="margin-bottom:12px"></el-alert>
+                    <el-tabs v-model="previewActiveSheet" @tab-change="loadSheetData">
+                        <el-tab-pane v-for="s in previewSheets" :key="s.sheetNo"
+                                     :label="s.sheetName || ('Sheet'+(s.sheetNo+1))" :name="String(s.sheetNo)">
+                        </el-tab-pane>
+                    </el-tabs>
+                    <el-table :data="previewRows" stripe size="small" max-height="500" v-loading="loadingSheet"
+                              class="preview-table" border>
+                        <el-table-column v-for="h in previewHeaders" :key="h.index"
+                                         :prop="String(h.index)" :label="h.label" min-width="100">
+                            <template #default="{row}">{{row[h.index]||''}}</template>
+                        </el-table-column>
+                    </el-table>
+                    <div style="margin-top:8px;color:#909399;font-size:13px" v-if="previewTotalRows>0">
+                        共 {{previewTotalRows}} 行数据
+                    </div>
+                </template>
+            </el-tab-pane>
+        </el-tabs>
+    </div>
+</div>
+<script>
+const { createApp, ref, reactive, onMounted } = Vue;
+const app = createApp({
+    setup() {
+        const activeTab = ref('template');
+
+        // Template Management
+        const templateJson = ref('');
+        const creating = ref(false);
+        const templates = ref([]);
+        const loadingTemplates = ref(false);
+        const viewingTemplate = ref(null);
+
+        const sampleTemplate = {
+            templateCode: "DEMO_TPL_001",
+            templateName: "演示模板-基础库存",
+            supplierName: "示例供应商",
+            allSheetsPrice: 0,
+            status: 1,
+            sheets: [{
+                sheetIndex: 0,
+                sheetName: "库存",
+                contentType: 1,
+                headerRowIndex: 0,
+                emptyRowThreshold: 2,
+                enableMergeCell: 1,
+                groups: [{
+                    groupSeq: 1,
+                    groupName: "默认组",
+                    fields: [{
+                        fieldCode: "category", fieldName: "品类", sourceType: "COLUMN",
+                        sourceConfig: { columnIndex: 0, matchMode: "INDEX" }, required: 1
+                    },{
+                        fieldCode: "spec", fieldName: "规格", sourceType: "COLUMN",
+                        sourceConfig: { columnIndex: 1, matchMode: "INDEX" }, required: 1
+                    },{
+                        fieldCode: "origin", fieldName: "产地", sourceType: "COLUMN",
+                        sourceConfig: { columnIndex: 2, matchMode: "INDEX" }
+                    },{
+                        fieldCode: "weight", fieldName: "重量", sourceType: "COLUMN",
+                        sourceConfig: { columnIndex: 3, matchMode: "INDEX" }
+                    },{
+                        fieldCode: "price", fieldName: "价格", sourceType: "COLUMN",
+                        sourceConfig: { columnIndex: 4, matchMode: "INDEX" }
+                    }]
+                }]
+            }]
+        };
+
+        function loadSampleTemplate() {
+            templateJson.value = JSON.stringify(sampleTemplate, null, 2);
+        }
+
+        async function createTemplate() {
+            creating.value = true;
+            try {
+                const body = JSON.parse(templateJson.value);
+                const res = await fetch('/api/v1/import-template', {
+                    method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body)
+                });
+                const data = await res.json();
+                if (data.code === 200) {
+                    ElementPlus.ElMessage.success('模板创建成功, ID: ' + data.data.id);
+                    loadTemplates();
+                } else {
+                    ElementPlus.ElMessage.error(data.message);
+                }
+            } catch (e) {
+                ElementPlus.ElMessage.error('JSON格式错误: ' + e.message);
+            } finally { creating.value = false; }
+        }
+
+        async function loadTemplates() {
+            loadingTemplates.value = true;
+            try {
+                const res = await fetch('/api/v1/import-template/list');
+                const data = await res.json();
+                if (data.code === 200) templates.value = data.data || [];
+            } catch (e) {
+                ElementPlus.ElMessage.error('加载失败: ' + e.message);
+            } finally { loadingTemplates.value = false; }
+        }
+
+        async function viewTemplate(id) {
+            try {
+                const res = await fetch('/api/v1/import-template/' + id);
+                const data = await res.json();
+                if (data.code === 200) viewingTemplate.value = data.data;
+                else ElementPlus.ElMessage.error(data.message);
+            } catch (e) { ElementPlus.ElMessage.error(e.message); }
+        }
+
+        async function deleteTemplate(id) {
+            try {
+                await fetch('/api/v1/import-template/' + id, { method: 'DELETE' });
+                ElementPlus.ElMessage.success('删除成功');
+                loadTemplates();
+                if (viewingTemplate.value?.template?.id === id) viewingTemplate.value = null;
+            } catch (e) { ElementPlus.ElMessage.error(e.message); }
+        }
+
+        // Import Test
+        const importTemplateId = ref(null);
+        const importFile = ref(null);
+        const importing = ref(false);
+        const importResult = ref(null);
+        const importViewTab = ref('inventory');
+        const importUploadRef = ref(null);
+
+        function onImportFileChange(f) { importFile.value = f.raw; }
+
+        async function doImportPreview() {
+            importing.value = true;
+            importResult.value = null;
+            try {
+                const fd = new FormData();
+                fd.append('file', importFile.value);
+                fd.append('templateId', importTemplateId.value);
+                const res = await fetch('/api/v1/dynamic-import/preview', { method: 'POST', body: fd });
+                const data = await res.json();
+                if (data.code === 200) {
+                    importResult.value = data.data;
+                    ElementPlus.ElMessage.success('导入预览完成');
+                } else {
+                    ElementPlus.ElMessage.error(data.message);
+                }
+            } catch (e) { ElementPlus.ElMessage.error(e.message); }
+            finally { importing.value = false; }
+        }
+
+        // Excel Preview
+        const previewFileObj = ref(null);
+        const previewUploading = ref(false);
+        const previewFileId = ref('');
+        const previewFileName = ref('');
+        const previewSheets = ref([]);
+        const previewActiveSheet = ref('0');
+        const previewHeaders = ref([]);
+        const previewRows = ref([]);
+        const previewTotalRows = ref(0);
+        const loadingSheet = ref(false);
+        const previewUploadRef = ref(null);
+
+        function onPreviewFileChange(f) { previewFileObj.value = f.raw; }
+
+        async function doPreviewUpload() {
+            previewUploading.value = true;
+            previewSheets.value = [];
+            try {
+                const fd = new FormData();
+                fd.append('file', previewFileObj.value);
+                const res = await fetch('/api/v1/excel-preview/upload', { method: 'POST', body: fd });
+                const data = await res.json();
+                if (data.code === 200) {
+                    previewFileId.value = data.data.fileId;
+                    previewFileName.value = data.data.fileName;
+                    previewSheets.value = data.data.sheets || [];
+                    if (previewSheets.value.length > 0) {
+                        previewActiveSheet.value = String(previewSheets.value[0].sheetNo);
+                        loadSheetData(previewActiveSheet.value);
+                    }
+                } else { ElementPlus.ElMessage.error(data.message); }
+            } catch (e) { ElementPlus.ElMessage.error(e.message); }
+            finally { previewUploading.value = false; }
+        }
+
+        async function loadSheetData(sheetNo) {
+            loadingSheet.value = true;
+            try {
+                const res = await fetch(`/api/v1/excel-preview/${previewFileId.value}/sheet/${sheetNo}`);
+                const data = await res.json();
+                if (data.code === 200) {
+                    previewHeaders.value = data.data.headers || [];
+                    previewRows.value = data.data.rows || [];
+                    previewTotalRows.value = data.data.totalRows || 0;
+                } else { ElementPlus.ElMessage.error(data.message); }
+            } catch (e) { ElementPlus.ElMessage.error(e.message); }
+            finally { loadingSheet.value = false; }
+        }
+
+        onMounted(() => { loadTemplates(); });
+
+        return {
+            activeTab,
+            templateJson, creating, templates, loadingTemplates, viewingTemplate,
+            loadSampleTemplate, createTemplate, loadTemplates, viewTemplate, deleteTemplate,
+            importTemplateId, importFile, importing, importResult, importViewTab, importUploadRef,
+            onImportFileChange, doImportPreview,
+            previewFileObj, previewUploading, previewFileId, previewFileName,
+            previewSheets, previewActiveSheet, previewHeaders, previewRows, previewTotalRows,
+            loadingSheet, previewUploadRef, onPreviewFileChange, doPreviewUpload, loadSheetData
+        };
+    }
+});
+app.use(ElementPlus, { locale: ElementPlusLocaleZhCn });
+app.mount('#app');
+</script>
+</body>
+</html>
