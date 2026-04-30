@@ -3,6 +3,7 @@
 -------------------------------------------------------------------------------
   作者     : 优化版 2026-04-30
   原作者   : 黄好庭 2025-12-02
+  目标版本 : SQL Server 2008 R2 及以上
   说明     : 把原 VB6 端的 4 阶段算法整体下沉到 SQL Server 存储过程，
              既便于单元测试，也避免 VB ↔ SQL 多次往返。
 
@@ -17,6 +18,16 @@
              3=累计核销-末笔无加成（待核销总量不足覆盖收货）
 
   守恒律   : Init + IWeight = OWeight + BalWeight  （任意 MO 始终成立）
+
+  SQL Server 2008 兼容性说明:
+    - 不使用 SUM() OVER (ORDER BY ...) 聚合窗口框架（2012+）
+      ⇒ 改用 ROW_NUMBER() + 自连接计算累计
+    - 不使用 THROW（2012+）
+      ⇒ 改用 RAISERROR + ERROR_MESSAGE()
+    - 不使用 CREATE TABLE 内联 INDEX 子句（2014+）
+      ⇒ 拆分成独立的 CREATE INDEX
+    - MERGE / CTE / ROW_NUMBER() OVER / 聚合 OVER (PARTITION BY 不带 ORDER BY)
+      / TRY...CATCH 这些 2008 都支持
 =============================================================================*/
 
 SET ANSI_NULLS ON;
@@ -215,11 +226,13 @@ BEGIN
         ),
         -- 仅对正向单据做精确匹配（净退料/净退货不参与精确配对，避免 -3 与 -3 也被匹配掉）
         OutPos AS (
-            SELECT *, ROW_NUMBER() OVER (PARTITION BY MOBillID ORDER BY weight, OutBillID) AS rn
+            SELECT OutBillID, MOBillID, weight,
+                   ROW_NUMBER() OVER (PARTITION BY MOBillID ORDER BY weight, OutBillID) AS rn
               FROM OutBills WHERE weight > 0
         ),
         InPos AS (
-            SELECT *, ROW_NUMBER() OVER (PARTITION BY MOBillID ORDER BY weight, InBillID) AS rn
+            SELECT InBillID, MOBillID, weight,
+                   ROW_NUMBER() OVER (PARTITION BY MOBillID ORDER BY weight, InBillID) AS rn
               FROM InBills WHERE weight > 0
         )
         INSERT INTO #MatchedOutBills (MOBillID, OutBillID, InBillID, OutWeight, InWeight)
@@ -246,13 +259,13 @@ BEGIN
               NeedFromS     = MAX(N - Init, 0)    = 需要从本期上料填补的量
 
           排序：RBTAG DESC（先取退/补料）→ billdate → acctime → billid → OutItmID
-          累计：cum = SUM(oweight) OVER (ORDER BY ...)
+          累计：cum = SUM(oweight) WHERE rn <= self.rn  （SQL Server 2008 兼容写法）
 
           分配规则（逐条剩余上料明细）：
               若 N <= 0          ⇒ 不写明细
               若 NeedFromS = 0   ⇒ 不写明细（期初足够覆盖收货）
               若 T >= N          ⇒ 末笔加成
-                 - cum < NeedFromS                              → UseWeight=oweight, SrcTag=1
+                 - cum <= NeedFromS                             → UseWeight=oweight, SrcTag=1
                  - prev_cum < NeedFromS <= cum                  → UseWeight=(NeedFromS - prev_cum)*1.05, SrcTag=2
                  - prev_cum >= NeedFromS                        → 不写
               若 T <  N          ⇒ 总量不足，剩余上料全部核销
@@ -262,13 +275,38 @@ BEGIN
           回写 CO_MO_WIP（保证守恒律 Init + IWeight = OWeight + BalWeight）：
               OWeight  = MatchedOut + InitConsumed + SUM(MESOut.UseWeight)
               BalWeight = Init + IWeight - OWeight
+        ------------------------------------------------------------------------
+          【SQL Server 2008 改写要点】
+            原版用 SUM(oweight) OVER (PARTITION BY MOBillID ORDER BY ...
+                                      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+            来计算累计，2008 不支持。
+            改写：
+              1) 用 ROW_NUMBER() OVER (PARTITION BY MOBillID ORDER BY ...) 算 rn
+                 落到 #SortedRemain 临时表
+              2) 用自连接 SUM(s2.oweight) WHERE s2.rn <= s1.rn 算累计 cum
+                 因为按 MOBillID 分区，每个 MO 明细数一般不多，O(n²) 可接受
         ======================================================================*/
+
+        IF OBJECT_ID('tempdb..#SortedRemain') IS NOT NULL DROP TABLE #SortedRemain;
+        CREATE TABLE #SortedRemain (
+            MOBillID    NVARCHAR(64)  NOT NULL,
+            billid      NVARCHAR(64)  NOT NULL,
+            billno      NVARCHAR(64)  NULL,
+            billdate    DATETIME      NULL,
+            acctime     DATETIME      NULL,
+            RBTAG       INT           NOT NULL,
+            OutItmID    NVARCHAR(64)  NOT NULL,
+            oweight     DECIMAL(28,8) NOT NULL,
+            oqty        DECIMAL(28,8) NULL,
+            rn          INT           NOT NULL,
+            PRIMARY KEY (MOBillID, rn)
+        );
 
         ;WITH RemainOut AS (
             SELECT m.billid, m.srcbillid AS MOBillID, m.billdate, m.billno, m.acctime,
                    ISNULL(m.rbtag, 0) AS RBTAG, i.id AS OutItmID,
-                   CASE WHEN ISNULL(m.rbtag,0) IN (1,2) THEN -1.0 ELSE 1.0 END * ISNULL(i.weight,0) AS oweight,
-                   CASE WHEN ISNULL(m.rbtag,0) IN (1,2) THEN -1.0 ELSE 1.0 END * ISNULL(i.qty,0)    AS oqty
+                   CAST(CASE WHEN ISNULL(m.rbtag,0) IN (1,2) THEN -1.0 ELSE 1.0 END * ISNULL(i.weight,0) AS DECIMAL(28,8)) AS oweight,
+                   CAST(CASE WHEN ISNULL(m.rbtag,0) IN (1,2) THEN -1.0 ELSE 1.0 END * ISNULL(i.qty,0)    AS DECIMAL(28,8)) AS oqty
               FROM mes_ws_materials_out_i i
               INNER JOIN mes_ws_materials_out_m m ON m.billid = i.billid
               LEFT  JOIN #MatchedOutBills mb     ON mb.OutBillID = m.billid
@@ -277,59 +315,65 @@ BEGIN
                 AND ISNULL(i.deleted, 0) = 0
                 AND m.srcbillid IS NOT NULL
                 AND mb.OutBillID IS NULL
-        ),
-        MatchedAgg AS (
+        )
+        INSERT INTO #SortedRemain (MOBillID, billid, billno, billdate, acctime, RBTAG, OutItmID, oweight, oqty, rn)
+        SELECT MOBillID, billid, billno, billdate, acctime, RBTAG, OutItmID, oweight, oqty,
+               ROW_NUMBER() OVER (PARTITION BY MOBillID
+                   ORDER BY RBTAG DESC, billdate, acctime, billid, OutItmID) AS rn
+          FROM RemainOut;
+
+        /*------------------------------------------------------------------
+          构造每个 MO 的需求量 + 累计 + 末笔判定，写入 #Picked
+          再统一 INSERT 到 CO_MO_WIP_MESOut
+        ------------------------------------------------------------------*/
+        ;WITH MatchedAgg AS (
             SELECT MOBillID, SUM(InWeight) AS matched_in, SUM(OutWeight) AS matched_out
-              FROM #MatchedOutBills
-              GROUP BY MOBillID
+              FROM #MatchedOutBills GROUP BY MOBillID
         ),
         Demand AS (
             SELECT w.MOBillID,
                    ISNULL(w.GWeight, 0)    - ISNULL(ma.matched_in, 0)            AS N_NeedWriteOff,
                    ISNULL(w.InitWeight, 0)                                       AS Init,
-                   (SELECT ISNULL(SUM(oweight),0) FROM RemainOut r
+                   (SELECT ISNULL(SUM(oweight),0) FROM #SortedRemain r
                      WHERE r.MOBillID = w.MOBillID)                              AS S_Remain
               FROM CO_MO_WIP w
               LEFT JOIN MatchedAgg ma ON ma.MOBillID = w.MOBillID
               WHERE w.PID = @PID
         ),
-        Sorted AS (
-            SELECT r.*,
-                   ROW_NUMBER() OVER (PARTITION BY r.MOBillID
-                       ORDER BY r.RBTAG DESC, r.billdate, r.acctime, r.billid, r.OutItmID) AS rn,
-                   SUM(r.oweight) OVER (PARTITION BY r.MOBillID
-                       ORDER BY r.RBTAG DESC, r.billdate, r.acctime, r.billid, r.OutItmID
-                       ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cum
-              FROM RemainOut r
+        -- 用自连接算累计（2008 兼容）
+        Cum AS (
+            SELECT s1.MOBillID, s1.billid, s1.OutItmID, s1.RBTAG,
+                   s1.billdate, s1.acctime, s1.oweight, s1.oqty, s1.rn,
+                   ISNULL((SELECT SUM(s2.oweight) FROM #SortedRemain s2
+                            WHERE s2.MOBillID = s1.MOBillID AND s2.rn <= s1.rn), 0) AS cum,
+                   ISNULL((SELECT MAX(s3.rn) FROM #SortedRemain s3
+                            WHERE s3.MOBillID = s1.MOBillID), 0)                    AS max_rn
+              FROM #SortedRemain s1
         ),
         Joined AS (
-            SELECT s.*,
+            SELECT c.*,
                    d.N_NeedWriteOff,
                    d.Init,
                    d.S_Remain,
                    (d.Init + d.S_Remain)                              AS T_Total,
                    CASE WHEN d.N_NeedWriteOff - d.Init > 0
                         THEN d.N_NeedWriteOff - d.Init ELSE 0 END     AS NeedFromS,
-                   (s.cum - s.oweight)                                AS prev_cum,
-                   MAX(s.rn) OVER (PARTITION BY s.MOBillID)           AS max_rn
-              FROM Sorted s
-              INNER JOIN Demand d ON d.MOBillID = s.MOBillID
+                   (c.cum - c.oweight)                                AS prev_cum
+              FROM Cum c
+              INNER JOIN Demand d ON d.MOBillID = c.MOBillID
               WHERE d.N_NeedWriteOff > 0
         ),
         Picked AS (
             SELECT j.*,
                    /* UseWeight */
                    CASE
-                       /* 期初足以覆盖收货 ⇒ 本期上料零消耗，不写明细 */
                        WHEN j.NeedFromS <= 0 THEN NULL
-                       /* 总量足够：末笔加成 */
                        WHEN j.T_Total >= j.N_NeedWriteOff THEN
                             CASE
                                 WHEN j.cum      <= j.NeedFromS THEN j.oweight
                                 WHEN j.prev_cum <  j.NeedFromS THEN (j.NeedFromS - j.prev_cum) * @Coef
                                 ELSE NULL
                             END
-                       /* 总量不足：全部剩余上料按原值核销 */
                        ELSE j.oweight
                    END AS UseWeight,
                    /* SrcTag */
@@ -360,7 +404,7 @@ BEGIN
         /*======================================================================
           回写 CO_MO_WIP.OWeight、BalWeight
             OWeight  = MatchedOut + InitConsumed + SUM(MESOut.UseWeight)
-            BalWeight = Init + IWeight - OWeight   (永远 >= 0，守恒)
+            BalWeight = Init + IWeight - OWeight   (守恒)
         ======================================================================*/
         ;WITH MatchedAgg AS (
             SELECT MOBillID, SUM(InWeight) AS matched_in, SUM(OutWeight) AS matched_out
@@ -407,13 +451,22 @@ BEGIN
          WHERE PID = @PID;
 
         IF OBJECT_ID('tempdb..#MatchedOutBills') IS NOT NULL DROP TABLE #MatchedOutBills;
+        IF OBJECT_ID('tempdb..#SortedRemain')   IS NOT NULL DROP TABLE #SortedRemain;
 
         IF @ownTran = 1 COMMIT TRAN;
     END TRY
     BEGIN CATCH
+        DECLARE @errMsg   NVARCHAR(4000) = ERROR_MESSAGE();
+        DECLARE @errSev   INT            = ERROR_SEVERITY();
+        DECLARE @errState INT            = ERROR_STATE();
+
         IF @ownTran = 1 AND @@TRANCOUNT > 0 ROLLBACK TRAN;
         IF OBJECT_ID('tempdb..#MatchedOutBills') IS NOT NULL DROP TABLE #MatchedOutBills;
-        THROW;
+        IF OBJECT_ID('tempdb..#SortedRemain')   IS NOT NULL DROP TABLE #SortedRemain;
+
+        -- SQL Server 2008 不支持 THROW，用 RAISERROR 重抛
+        RAISERROR (@errMsg, @errSev, @errState);
+        RETURN;
     END CATCH
 END
 GO

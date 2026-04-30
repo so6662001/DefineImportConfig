@@ -3,6 +3,7 @@
 > 优化日期：2026-04-30
 > 原版作者：黄好庭 2025-12-02
 > 业务：根据生产收货匹配上料，按 MO 配比核销，落到 `CO_MO_WIP` / `CO_MO_WIP_MESOut`
+> **目标 SQL Server 版本：2008 R2 及以上**
 
 ---
 
@@ -73,7 +74,10 @@
 | `NeedFromS` | 需从本期上料填补 = `MAX(N − Init, 0)` |
 
 剩余上料按 `RBTAG DESC, billdate, acctime, billid, OutItmID` 排序，
-用 `SUM(oweight) OVER (ORDER BY ...)` 算累计 `cum`。
+用 `ROW_NUMBER() OVER (PARTITION BY MOBillID ORDER BY ...)` 落到 `#SortedRemain` 临时表，
+再用自连接 `SUM(s2.oweight) WHERE s2.rn <= s1.rn` 算累计 `cum`
+（**SQL Server 2008 兼容写法**，因 2012+ 才支持 `SUM() OVER (ORDER BY ...)` 累计窗口）。
+按 MOBillID 分区，单 MO 明细数有限，O(n²) 性能可接受。
 
 #### 分配规则
 
@@ -114,7 +118,8 @@ BalWeight = Init + IWeight − OWeight
 
 ## 单元测试
 
-依赖：SQL Server 2017+ 与 `sqlcmd`
+依赖：SQL Server 2008 R2 及以上 + `sqlcmd`
+（实际跑通验证用的 SQL Server 2022，但代码严格只用 2008 支持的特性）
 
 ```bash
 # 1. 创建测试库（如果还没有）
@@ -169,7 +174,7 @@ sqlcmd -S localhost,1433 -U sa -P 'YourPwd!' -C -N -d MOWIP_TEST -b -i tests/tes
 | 7 | 累计求和用 `s2.rn ≤ s1.rn` 自连接，O(n²) | 改为 `SUM() OVER (...)`，O(n) |
 | 8 | 上一会计期 `TOP 1 ORDER BY BEGINDATE` 未限上界 | 加 `BEGINDATE < @BeginDate` |
 | 9 | 完工率 > 90% 直接 `OWeight = IWeight + InitWeight` 不写明细 ⇒ 总账与明细对不平 | 取消该分支，统一走 1.05 系数累计核销 |
-| 10 | 全过程无事务 | 加 `BEGIN TRAN/COMMIT/ROLLBACK + TRY/CATCH + THROW` |
+| 10 | 全过程无事务 | 加 `BEGIN TRAN/COMMIT/ROLLBACK + TRY/CATCH + RAISERROR` |
 | 11 | 日期格式 `yyyy-MM-dd` 依赖会话语言 | 改为 `yyyyMMdd` 或参数化 DATETIME |
 | 12 | 末笔判定用 `cum ≥ N`，未考虑期初先消耗 | 改为 `cum ≥ NeedFromS = max(N − Init, 0)` |
 | 13 | `OWeight = SUM(UseWeight)` 漏算精确匹配 + 期初消耗 ⇒ 不守恒 | 改为 `OWeight = MatchedOut + InitConsumed + SUM(UseWeight)` |
@@ -179,8 +184,37 @@ sqlcmd -S localhost,1433 -U sa -P 'YourPwd!' -C -N -d MOWIP_TEST -b -i tests/tes
 ### 性能优化
 
 - 取消 VB 端逐 MO `Do While` 循环，整个算法一次往返完成
-- `SUM() OVER (ORDER BY ...)` 替代自连接，O(n²) → O(n)
+- 阶段 0/1/2 全部用集合化 SQL（MERGE / CTE / ROW_NUMBER）
 - `#MatchedOutBills` 加 `OutBillID` 主键 + `InBillID` 唯一约束加速 LEFT JOIN
+- 阶段 3 累计因 SQL Server 2008 不支持 `SUM() OVER (ORDER BY ...)`，改为
+  ROW_NUMBER + 自连接（按 MOBillID 分区，单 MO 明细数有限，O(n²) 可接受）
+
+### SQL Server 2008 兼容性
+
+本存储过程严格只使用 SQL Server 2008 R2 支持的特性：
+
+| 特性 | 2008 支持 | 用法 |
+| --- | :---: | --- |
+| `MERGE` | ✅ (2008 引入) | 阶段 1 |
+| `CTE`（`WITH ...`） | ✅ | 全部阶段 |
+| `ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...)` | ✅ | 阶段 2/3 |
+| 聚合 `OVER (PARTITION BY ...)` 不带 ORDER BY | ✅ | 未使用 |
+| `TRY ... CATCH` | ✅ | 异常处理 |
+| `RAISERROR` | ✅ | 异常重抛 |
+| `DECLARE @x INT = 1`（变量初始化） | ✅ (2008 引入) | 多处 |
+| `SET XACT_ABORT ON` | ✅ | 事务一致性 |
+
+不使用的特性（避开 2012+）：
+
+| 特性 | 引入版本 | 替代方案 |
+| --- | :---: | --- |
+| `SUM() OVER (ORDER BY ... ROWS ...)` 累计窗口 | 2012 | ROW_NUMBER + 自连接 |
+| `THROW` | 2012 | `RAISERROR(@msg, @sev, @state) + RETURN` |
+| `OFFSET ... FETCH` 分页 | 2012 | 未使用 |
+| `LAG()` / `LEAD()` 窗口函数 | 2012 | 用 `prev_cum = cum - oweight` 推导 |
+| `CREATE TABLE` 内联 `INDEX` | 2014 | 独立的 `CREATE INDEX` 语句 |
+| `STRING_AGG` / `STRING_SPLIT` / `OPENJSON` 等 | 2016/2017 | 未使用 |
+| `DROP TABLE IF EXISTS` | 2016 | `IF OBJECT_ID(...) IS NOT NULL DROP TABLE` |
 
 ### 业务规则落地
 

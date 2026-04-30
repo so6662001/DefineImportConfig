@@ -109,9 +109,10 @@ CREATE TABLE CO_MO_WIP (
     InitStdTaxATM   DECIMAL(28,8) NULL, IStdTaxATM    DECIMAL(28,8) NULL,
     OStdTaxATM      DECIMAL(28,8) NULL, BalStdTaxATM  DECIMAL(28,8) NULL,
     InitExpTaxATM   DECIMAL(28,8) NULL, IExpTaxATM    DECIMAL(28,8) NULL,
-    OExpTaxATM      DECIMAL(28,8) NULL, BalExpTaxATM  DECIMAL(28,8) NULL,
-    INDEX IX_CO_MO_WIP_PID_MOBillID (PID, MOBillID)
+    OExpTaxATM      DECIMAL(28,8) NULL, BalExpTaxATM  DECIMAL(28,8) NULL
 );
+GO
+CREATE INDEX IX_CO_MO_WIP_PID_MOBillID ON CO_MO_WIP (PID, MOBillID);
 GO
 
 -- 用料明细
@@ -126,7 +127,8 @@ CREATE TABLE CO_MO_WIP_MESOut (
     UseQTY          DECIMAL(28,8) NULL,
     UseWeight       DECIMAL(28,8) NULL,
     ltime           DATETIME      NULL,
-    SrcTag          INT           NULL,    -- 1=普通核销 2=末笔加成 3=末笔无加成
-    INDEX IX_MESOut_PID_MO (PID, MOBillID)
+    SrcTag          INT           NULL    -- 1=普通核销 2=末笔加成 3=末笔无加成
 );
+GO
+CREATE INDEX IX_MESOut_PID_MO ON CO_MO_WIP_MESOut (PID, MOBillID);
 GO
